@@ -26,6 +26,7 @@
  *   Ctrl+D          다크 모드 토글
  *   Ctrl+B          책갈피 추가/제거 (현재 위치)
  *   F2 / Shift+F2   다음/이전 책갈피
+ *   Ctrl+T          목차 (마크다운 # 헤딩)
  *   F11             전체화면 토글 (Esc로도 빠져나옴)
  *   Space           자동 스크롤 토글 (진행 중 휠로 속도 조절)
  *   ↑/↓             한 줄 스크롤
@@ -82,6 +83,7 @@
 #define IDM_FIND_PREV       1016
 #define IDM_DARK_MODE       1017
 #define IDM_CHOOSE_FONT     1018
+#define IDM_SHOW_TOC        1019
 #define IDM_COPY            1030
 #define IDM_SELECT_ALL      1031
 #define IDM_BM_TOGGLE       1040
@@ -90,8 +92,10 @@
 #define IDM_BM_CLEAR        1043
 #define IDM_ENC_AUTO        1020
 #define IDM_RECENT_BASE     1100        /* 1100..1109 */
+#define IDM_TOC_BASE        2000        /* 2000..2000+toc_count-1 */
 #define RECENT_MAX          10
 #define RECENT_REG_PATH     L"Software\\hview\\Recent"
+#define SETTINGS_REG_PATH   L"Software\\hview\\Settings"
 #define IDM_ENC_UTF8        1021
 #define IDM_ENC_UTF16LE     1022
 #define IDM_ENC_UTF16BE     1023
@@ -1240,6 +1244,110 @@ static void cmd_find_again(BOOL forward) {
 }
 
 /* ------------------------------------------------------------------
+ * 마크다운 목차 (Ctrl+T) — `# ... ######` 헤딩을 추출하여 팝업 메뉴.
+ *
+ * 일반 텍스트의 휴리스틱(빈 줄+짧은 줄)은 후속 phase. 일단 마크다운만.
+ * 메뉴 항목 ID는 IDM_TOC_BASE + index로 일회성 사용.
+ * ------------------------------------------------------------------ */
+static void cmd_show_toc(void) {
+    if (g_state.line_count == 0 || g_state.text_len == 0) return;
+
+    HMENU menu = CreatePopupMenu();
+    int count = 0;
+
+    for (int i = 0; i < g_state.line_count && count < 1000; i++) {
+        int ls = g_state.line_offsets[i];
+        int le = g_state.line_offsets[i + 1];
+        if (ls >= le) continue;
+        if (g_state.text[ls] != L'#') continue;
+
+        /* 연속 # 카운트 — 1~6 */
+        int level = 0, pos = ls;
+        while (pos < le && g_state.text[pos] == L'#' && level < 6) {
+            level++;
+            pos++;
+        }
+        if (level == 0) continue;
+
+        /* # 뒤에는 공백/줄끝이어야 헤딩 — `#word`는 헤딩 아님 */
+        if (pos < le) {
+            wchar_t c = g_state.text[pos];
+            if (c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') continue;
+        }
+        while (pos < le &&
+               (g_state.text[pos] == L' ' || g_state.text[pos] == L'\t')) {
+            pos++;
+        }
+
+        int text_end = le;
+        while (text_end > pos) {
+            wchar_t c = g_state.text[text_end - 1];
+            if (c == L'\r' || c == L'\n') text_end--;
+            else break;
+        }
+
+        /* 라벨: 들여쓰기(레벨-1)*2 공백 + 본문(최대 200자) */
+        wchar_t label[256];
+        int indent = (level - 1) * 2;
+        if (indent > 16) indent = 16;
+        for (int j = 0; j < indent; j++) label[j] = L' ';
+        int max_text = 255 - indent - 1;
+        int text_len = text_end - pos;
+        if (text_len > max_text) text_len = max_text;
+        if (text_len < 0) text_len = 0;
+        memcpy(&label[indent], &g_state.text[pos],
+               (size_t)text_len * sizeof(wchar_t));
+        label[indent + text_len] = 0;
+
+        /* 빈 헤딩이면 placeholder */
+        if (text_len == 0) {
+            wcscpy_s(&label[indent], 256 - indent, L"(제목 없음)");
+        }
+
+        AppendMenuW(menu, MF_STRING,
+                    (UINT_PTR)(IDM_TOC_BASE + count), label);
+        /* 메뉴 항목과 줄 번호 매핑 — itemData에 line 저장 */
+        MENUITEMINFOW mii;
+        memset(&mii, 0, sizeof(mii));
+        mii.cbSize = sizeof(mii);
+        mii.fMask  = MIIM_DATA;
+        mii.dwItemData = (ULONG_PTR)i;
+        SetMenuItemInfoW(menu, (UINT)(IDM_TOC_BASE + count), FALSE, &mii);
+        count++;
+    }
+
+    if (count == 0) {
+        DestroyMenu(menu);
+        MessageBoxW(g_state.hwnd,
+            L"마크다운 헤딩(# ...)을 찾을 수 없습니다.",
+            APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    /* 팝업 위치 — 키보드 호출이면 클라이언트 좌상단 근처로 */
+    POINT pt = { 50, 50 };
+    ClientToScreen(g_state.hwnd, &pt);
+
+    UINT cmd = (UINT)TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+        pt.x, pt.y, 0, g_state.hwnd, NULL);
+
+    if (cmd >= (UINT)IDM_TOC_BASE) {
+        MENUITEMINFOW mii;
+        memset(&mii, 0, sizeof(mii));
+        mii.cbSize = sizeof(mii);
+        mii.fMask  = MIIM_DATA;
+        if (GetMenuItemInfoW(menu, cmd, FALSE, &mii)) {
+            int line = (int)mii.dwItemData;
+            if (line >= 0 && line < g_state.line_count) {
+                scroll_to_line(line);
+            }
+        }
+    }
+    DestroyMenu(menu);
+}
+
+/* ------------------------------------------------------------------
  * 줄 이동 (Ctrl+G)
  *
  * 1-기반 줄 번호로 입력 받음. 음수/0/초과는 클램프.
@@ -1556,6 +1664,87 @@ static void recent_add(const wchar_t *path) {
     if (!g_state.fs_active) DrawMenuBar(g_state.hwnd);
 }
 
+/* ------------------------------------------------------------------
+ * 사용자 설정 영속화 — HKCU\Software\hview\Settings.
+ *
+ * 메뉴/단축키로 바뀐 표시 옵션을 세션 간 유지. 종료 시점(WM_DESTROY)에
+ * 한 번 저장하므로 비정상 종료 시 잃을 수 있음. 진짜 결정적 이슈는
+ * 책갈피처럼 사용자 데이터인데, 이건 후속 phase로.
+ * ------------------------------------------------------------------ */
+static void reg_set_dword(HKEY hk, const wchar_t *name, DWORD v) {
+    RegSetValueExW(hk, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+}
+static DWORD reg_get_dword(HKEY hk, const wchar_t *name, DWORD def) {
+    DWORD v = 0, sz = sizeof(v), type = 0;
+    if (RegQueryValueExW(hk, name, NULL, &type, (BYTE*)&v, &sz) ==
+        ERROR_SUCCESS && type == REG_DWORD) return v;
+    return def;
+}
+
+static void settings_load(void) {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0,
+                      KEY_READ, &hk) != ERROR_SUCCESS) return;
+
+    g_state.dark_mode          = reg_get_dword(hk, L"DarkMode", 0)    ? TRUE : FALSE;
+    g_state.show_line_numbers  = reg_get_dword(hk, L"LineNumbers", 0) ? TRUE : FALSE;
+    g_state.font_size          = (int)reg_get_dword(hk, L"FontSize", 11);
+    g_state.font_weight        = (LONG)reg_get_dword(hk, L"FontWeight", 0);
+    g_state.font_italic        = reg_get_dword(hk, L"FontItalic", 0)  ? 1 : 0;
+    g_state.line_spacing_extra = (int)reg_get_dword(hk, L"LineSpacing", 0);
+    g_state.char_spacing_extra = (int)reg_get_dword(hk, L"CharSpacing", 0);
+    g_state.margin_left_px     = (int)reg_get_dword(hk, L"MarginLeft", 0);
+    g_state.margin_top_px      = (int)reg_get_dword(hk, L"MarginTop", 0);
+    g_state.autoscroll_delay_ms = (int)reg_get_dword(hk, L"AutoscrollMs",
+                                                     AUTOSCROLL_DEFAULT_MS);
+
+    DWORD type = 0;
+    DWORD sz = sizeof(g_state.font_face);
+    if (RegQueryValueExW(hk, L"FontFace", NULL, &type,
+                         (BYTE*)g_state.font_face, &sz) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        g_state.font_face[0] = 0;
+    }
+
+    /* 범위 클램프 — 레지스트리가 망가져도 안전한 값으로 */
+    if (g_state.font_size < 6 || g_state.font_size > 72)
+        g_state.font_size = 11;
+    if (g_state.line_spacing_extra < 0 || g_state.line_spacing_extra > 32)
+        g_state.line_spacing_extra = 0;
+    if (g_state.char_spacing_extra < 0 || g_state.char_spacing_extra > 16)
+        g_state.char_spacing_extra = 0;
+    if (g_state.margin_left_px < 0)  g_state.margin_left_px = 0;
+    if (g_state.margin_top_px  < 0)  g_state.margin_top_px  = 0;
+
+    RegCloseKey(hk);
+}
+
+static void settings_save(void) {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, NULL, 0,
+                        KEY_WRITE, NULL, &hk, NULL) != ERROR_SUCCESS) return;
+
+    reg_set_dword(hk, L"DarkMode",     g_state.dark_mode ? 1 : 0);
+    reg_set_dword(hk, L"LineNumbers",  g_state.show_line_numbers ? 1 : 0);
+    reg_set_dword(hk, L"FontSize",     (DWORD)g_state.font_size);
+    reg_set_dword(hk, L"FontWeight",   (DWORD)g_state.font_weight);
+    reg_set_dword(hk, L"FontItalic",   g_state.font_italic ? 1 : 0);
+    reg_set_dword(hk, L"LineSpacing",  (DWORD)g_state.line_spacing_extra);
+    reg_set_dword(hk, L"CharSpacing",  (DWORD)g_state.char_spacing_extra);
+    reg_set_dword(hk, L"MarginLeft",   (DWORD)g_state.margin_left_px);
+    reg_set_dword(hk, L"MarginTop",    (DWORD)g_state.margin_top_px);
+    reg_set_dword(hk, L"AutoscrollMs", (DWORD)g_state.autoscroll_delay_ms);
+
+    if (g_state.font_face[0]) {
+        DWORD bytes = (DWORD)((wcslen(g_state.font_face) + 1) *
+                              sizeof(wchar_t));
+        RegSetValueExW(hk, L"FontFace", 0, REG_SZ,
+                       (const BYTE*)g_state.font_face, bytes);
+    }
+
+    RegCloseKey(hk);
+}
+
 static void recent_remove(int idx) {
     if (idx < 0 || idx >= g_state.recent_count) return;
     for (int i = idx; i < g_state.recent_count - 1; i++) {
@@ -1747,6 +1936,8 @@ static HMENU create_menu(void) {
                 L"이전 찾기\tShift+F3");
     AppendMenuW(view_menu, MF_STRING, IDM_GOTO,
                 L"줄 이동(&G)...\tCtrl+G");
+    AppendMenuW(view_menu, MF_STRING, IDM_SHOW_TOC,
+                L"목차(&T)\tCtrl+T");
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view_menu, MF_STRING, IDM_BM_TOGGLE,
                 L"책갈피 추가/제거(&B)\tCtrl+B");
@@ -1781,15 +1972,28 @@ static HMENU create_menu(void) {
  * ------------------------------------------------------------------ */
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_CREATE:
+    case WM_CREATE: {
         g_state.hwnd = hwnd;
-        g_state.font_size = 11;
+        g_state.font_size = 11;            /* 기본값 (settings_load가 덮음) */
+        g_state.autoscroll_delay_ms = AUTOSCROLL_DEFAULT_MS;
+        settings_load();
         g_state.search_match_pos = -1;
         g_state.sel_anchor = -1;
         g_state.sel_caret  = -1;
         create_font();
         DragAcceptFiles(hwnd, TRUE);
+        /* 로드된 토글 상태를 메뉴 체크 표시에 반영 */
+        HMENU m = GetMenu(hwnd);
+        if (m) {
+            CheckMenuItem(m, IDM_DARK_MODE,
+                          MF_BYCOMMAND | (g_state.dark_mode ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_LINENO,
+                          MF_BYCOMMAND | (g_state.show_line_numbers ?
+                                          MF_CHECKED : MF_UNCHECKED));
+        }
         return 0;
+    }
 
     case WM_SIZE: {
         g_state.client_w = LOWORD(lp);
@@ -1972,6 +2176,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'B':
             if (ctrl) cmd_bookmark_toggle();
             break;
+        case 'T':
+            if (ctrl) cmd_show_toc();
+            break;
         case VK_F2: {
             int shift = GetKeyState(VK_SHIFT) & 0x8000;
             cmd_bookmark_jump(shift ? FALSE : TRUE);
@@ -2020,6 +2227,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_BM_NEXT:     cmd_bookmark_jump(TRUE); break;
         case IDM_BM_PREV:     cmd_bookmark_jump(FALSE); break;
         case IDM_BM_CLEAR:    cmd_bookmark_clear(); break;
+        case IDM_SHOW_TOC:    cmd_show_toc(); break;
         case IDM_FONT_INC:     font_change(+1); break;
         case IDM_FONT_DEC:     font_change(-1); break;
         case IDM_CHOOSE_FONT:  cmd_choose_font(); break;
@@ -2066,6 +2274,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DESTROY:
+        settings_save();
         if (g_state.font) DeleteObject(g_state.font);
         free(g_state.raw_data);
         free(g_state.text);
