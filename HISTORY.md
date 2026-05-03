@@ -85,6 +85,7 @@
 - [ ] Ctrl+S 키 바인딩 누락 — 도움말 텍스트(`hview.c:2163`)는 "Ctrl+S 다른 이름으로 저장"을 안내하지만 `WM_KEYDOWN` 스위치에 `'S'` 핸들러 없음. `cmd_save_as()` 직접 호출 추가 필요
 - [ ] `SB_THUMBTRACK` 스크롤바 16비트 절단 (`hview.c:2907,2926`) — `HIWORD(wp)`는 16비트 한정이라 65535줄 초과 파일에서 썸 드래그 위치가 깨짐. `GetScrollInfo`로 32비트 위치 조회
 - [ ] `measure_max_line_width()` 가짜 샘플링 (`hview.c:760-762`) — 주석은 "1만 줄 샘플링"이라 적혀 있지만 실제로는 앞쪽 10000줄만 측정하고 나머지는 무시. 10000줄 초과 파일에서 가장 긴 줄이 후반부에 있으면 `max_line_px` 과소 추정 → 가로 스크롤 부족. 등간격 stride 샘플링(`step = doc_line_count / 10000`) 또는 문자 수 기반 후보 선별 후 GDI 측정으로 교체
+- [ ] 검색 함수들의 `active_pane` 무시 — `search_jump_to`(`hview.c:1642-1643`)와 `cmd_find`(`hview.c:1663`)가 `g_state.top_line`(페인 0)을 직접 참조해 split view에서 페인 1 활성 시 검색 시작점·가시성 판정이 어긋남. `pane_top_line(g_state.active_pane)` / `pane_line_offsets`로 교체
 
 검색 / UX
 - [ ] 대소문자 구분 옵션 (검색 다이얼로그 + 설정 영속화) — 현재 `hview.c:1604`에서 케이스-민감 고정
