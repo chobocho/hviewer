@@ -6,6 +6,7 @@
  *   - UTF-16 LE/BE (BOM 필수)
  *   - CP949 (EUC-KR 확장, Windows 한글 코드페이지)
  *   - Johab (조합형, 자체 구현)
+ *   - Shift-JIS (일본어, CP932)
  *
  * 판별 알고리즘 (우선순위):
  *   1. BOM 검사 (가장 신뢰도 높음)
@@ -31,6 +32,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "johab.h"
+#include "sjis.h"
 
 typedef enum {
     ENC_UNKNOWN = 0,
@@ -39,7 +41,8 @@ typedef enum {
     ENC_UTF16_BE,
     ENC_UTF8,
     ENC_CP949,
-    ENC_JOHAB
+    ENC_JOHAB,
+    ENC_SJIS
 } Encoding;
 
 static const wchar_t *encoding_name(Encoding e) {
@@ -50,6 +53,7 @@ static const wchar_t *encoding_name(Encoding e) {
     case ENC_UTF8:     return L"UTF-8";
     case ENC_CP949:    return L"CP949 (EUC-KR)";
     case ENC_JOHAB:    return L"Johab (조합형)";
+    case ENC_SJIS:     return L"Shift-JIS";
     default:           return L"Unknown";
     }
 }
@@ -171,9 +175,17 @@ static Encoding detect_encoding(const unsigned char *buf, size_t len) {
     int u8 = utf8_validity_score(buf, len);
     if (u8 >= 3) return ENC_UTF8;  /* 멀티바이트 3개 이상 모두 valid */
 
-    /* 3. CP949 vs Johab — 점수 높은 쪽 */
+    /* 3. Shift-JIS: 반각 가나(0xA1-0xDF) 비율이 높으면 우선 판별 */
+    int sj = sjis_score(buf, len);
+
+    /* 4. CP949 vs Johab — 점수 높은 쪽 */
     int cp = cp949_score(buf, len);
     int jh = johab_score(buf, len);
+
+    /* SJIS는 한글 인코딩과 바이트 패턴이 겹치므로
+     * 반각 가나(0xA1-0xDF)나 SJIS 전용 lead(0x81-0x9F, 0xE0-0xFC)가
+     * 충분히 많을 때만 SJIS로 판단 */
+    if (sj > cp + 20 && sj > jh + 20 && sj >= 60) return ENC_SJIS;
 
     /* 둘 다 낮으면 ASCII거나 식별 불가 — CP949 기본값
      * (Windows 한글 환경 표준) */
@@ -259,12 +271,22 @@ static wchar_t *convert_to_utf16(const unsigned char *src, size_t src_len,
     }
 
     case ENC_JOHAB: {
-        /* 최악의 경우 src_len개 wchar (ASCII 1:1 매핑) */
         wchar_t *buf = (wchar_t*)malloc((n + 1) * sizeof(wchar_t));
         if (!buf) return NULL;
         size_t wlen = johab_to_utf16(p, n, buf);
         buf[wlen] = 0;
         *out_len = wlen;
+        return buf;
+    }
+
+    case ENC_SJIS: {
+        int wlen = MultiByteToWideChar(932, 0, (const char*)p, (int)n, NULL, 0);
+        if (wlen <= 0) return NULL;
+        wchar_t *buf = (wchar_t*)malloc((size_t)(wlen + 1) * sizeof(wchar_t));
+        if (!buf) return NULL;
+        MultiByteToWideChar(932, 0, (const char*)p, (int)n, buf, wlen);
+        buf[wlen] = 0;
+        *out_len = (size_t)wlen;
         return buf;
     }
 
