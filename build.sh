@@ -6,7 +6,7 @@
 
 gcc -O2 -municode -mwindows -Wall -Wextra -s \
     hview.c -o hview.exe \
-    -luser32 -lgdi32 -lcomdlg32 -lshell32
+    -luser32 -lgdi32 -lcomdlg32 -lshell32 -ladvapi32
 
 echo "빌드 완료: hview.exe"
 ls -lh hview.exe

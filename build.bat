@@ -5,7 +5,7 @@ REM /O2: 속도 최적화
 REM /W3: 경고 레벨 3
 
 cl /nologo /O2 /MT /W3 hview.c ^
-   user32.lib gdi32.lib comdlg32.lib shell32.lib ^
+   user32.lib gdi32.lib comdlg32.lib shell32.lib advapi32.lib ^
    /link /SUBSYSTEM:WINDOWS /OUT:hview.exe
 
 if exist hview.obj del hview.obj
