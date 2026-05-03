@@ -42,6 +42,7 @@
  *   Shift+휠        줄 간격 조절
  *   Ctrl+Shift+휠   자간 조절
  *   Alt+1           두 쪽 보기(분할) 토글
+ *   F1              단축키 도움말
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -120,6 +121,7 @@
 #define IDM_ENC_CP949       1024
 #define IDM_ENC_JOHAB       1025
 #define IDM_ENC_SJIS        1026
+#define IDM_HELP            1089
 #define IDM_ABOUT           1090
 
 /* ------------------------------------------------------------------
@@ -2149,6 +2151,64 @@ static void cmd_toggle_line_numbers(void) {
  * 두 번째 호출 시 저장해둔 스타일/위치로 복원.
  * Esc로도 빠져나올 수 있게 wnd_proc에서 처리.
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+ * 단축키 도움말 — F1 또는 메뉴에서 호출.
+ * 파일 상단 키 바인딩 주석과 동기 유지 (변경 시 양쪽 같이).
+ * ------------------------------------------------------------------ */
+static void cmd_show_help(void) {
+    static const wchar_t *help_text =
+        L"[파일]\n"
+        L"  Ctrl+O                     파일 열기\n"
+        L"  Ctrl+S                     다른 이름으로 저장\n"
+        L"\n"
+        L"[편집]\n"
+        L"  Ctrl+C                     선택 영역 복사\n"
+        L"  Ctrl+A                     모두 선택\n"
+        L"  마우스 드래그              텍스트 선택\n"
+        L"\n"
+        L"[찾기 / 이동]\n"
+        L"  Ctrl+F                     찾기\n"
+        L"  F3 / Shift+F3              다음 / 이전 찾기\n"
+        L"  Ctrl+G                     줄 이동\n"
+        L"  Ctrl+T                     목차 (마크다운 # 헤딩)\n"
+        L"\n"
+        L"[책갈피]\n"
+        L"  Ctrl+B                     현재 위치 책갈피 추가/제거\n"
+        L"  Ctrl+, / Ctrl+.            이전 / 다음 책갈피\n"
+        L"\n"
+        L"[보기]\n"
+        L"  Ctrl+L                     줄 번호 표시 토글\n"
+        L"  Ctrl+D                     다크 모드 토글\n"
+        L"  Ctrl+W                     자동 줄바꿈 토글\n"
+        L"  Alt+1                      두 쪽 보기(분할) 토글\n"
+        L"  F11                        전체화면 토글 (Esc로 해제)\n"
+        L"\n"
+        L"[인코딩]\n"
+        L"  F2 / Shift+F2              인코딩 순환 (다음 / 이전)\n"
+        L"\n"
+        L"[폰트]\n"
+        L"  Ctrl+Shift+, / Ctrl+Shift+.  폰트 크기 - / +\n"
+        L"  Ctrl+휠                    폰트 크기 - / +\n"
+        L"  Shift+휠                   줄 간격 조절\n"
+        L"  Ctrl+Shift+휠              자간 조절\n"
+        L"\n"
+        L"[스크롤]\n"
+        L"  ↑ / ↓                      한 줄 스크롤\n"
+        L"  PageUp / PageDown          한 화면 스크롤\n"
+        L"  Home / End                 문서 처음 / 끝\n"
+        L"  Ctrl+Home / Ctrl+End       문서 처음 / 끝\n"
+        L"  ← / →                      가로 스크롤\n"
+        L"  Alt+← / → / ↑ / ↓          여백 조절\n"
+        L"  Space                      자동 스크롤 토글 (진행 중 휠로 속도 조절)\n"
+        L"\n"
+        L"[도움말]\n"
+        L"  F1                         이 도움말";
+
+    MessageBoxW(g_state.hwnd, help_text,
+                L"hViewer 단축키 & 도움말",
+                MB_OK | MB_ICONINFORMATION);
+}
+
 static void cmd_toggle_fullscreen(void) {
     HWND hwnd = g_state.hwnd;
     if (!g_state.fs_active) {
@@ -2753,6 +2813,8 @@ static HMENU create_menu(void) {
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)enc_menu, L"인코딩(&E)");
 
     HMENU help_menu = CreatePopupMenu();
+    AppendMenuW(help_menu, MF_STRING, IDM_HELP, L"단축키 도움말(&K)\tF1");
+    AppendMenuW(help_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(help_menu, MF_STRING, IDM_ABOUT, L"정보(&A)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)help_menu, L"도움말(&H)");
 
@@ -3021,6 +3083,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             cmd_find_again(shift ? FALSE : TRUE);
             break;
         }
+        case VK_F1:
+            cmd_show_help();
+            break;
         case VK_F11:
             cmd_toggle_fullscreen();
             break;
@@ -3082,6 +3147,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_ENC_CP949:   reload_with_encoding(ENC_CP949); break;
         case IDM_ENC_JOHAB:   reload_with_encoding(ENC_JOHAB); break;
         case IDM_ENC_SJIS:    reload_with_encoding(ENC_SJIS); break;
+        case IDM_HELP:
+            cmd_show_help();
+            break;
         case IDM_ABOUT:
             MessageBoxW(hwnd,
                 L"hViewer — Win32 무료 한글 텍스트 뷰어\n"
