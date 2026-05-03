@@ -40,6 +40,7 @@
  *   Ctrl+휠         폰트 크기 -/+
  *   Shift+휠        줄 간격 조절
  *   Ctrl+Shift+휠   자간 조절
+ *   Alt+1           두 쪽 보기(분할) 토글
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -54,6 +55,7 @@
 #include <limits.h>
 
 #include "encoding.h"
+#include "hanja.h"
 
 /* ------------------------------------------------------------------
  * 상수
@@ -69,6 +71,9 @@
 #define AUTOSCROLL_MAX_MS     2000
 
 #define MAX_BOOKMARKS       32
+
+/* 분할 보기 — 가운데 디바이더 폭 */
+#define SPLIT_DIVIDER_PX    6
 
 /* 메뉴 ID */
 #define IDM_OPEN            1001
@@ -86,6 +91,8 @@
 #define IDM_CHOOSE_FONT     1018
 #define IDM_SHOW_TOC        1019
 #define IDM_WRAP            1027
+#define IDM_SPLIT           1028
+#define IDM_HANJA           1029
 #define IDM_COPY            1030
 #define IDM_SELECT_ALL      1031
 #define IDM_BM_TOGGLE       1040
@@ -141,9 +148,14 @@ typedef struct {
     /* 자동 줄바꿈 모드 */
     BOOL           wrap_mode;
 
-    /* 뷰포트 */
+    /* 뷰포트 — 분할 보기 시 두 페인이 독립 스크롤.
+     * 비분할 시 pane 1 필드는 사용하지 않음. */
     int            top_line;
     int            h_scroll_px;     /* 가로 스크롤 (픽셀) */
+    int            top_line2;       /* pane 1의 top_line (분할 시) */
+    int            h_scroll_px2;    /* pane 1의 h_scroll_px */
+    int            active_pane;     /* 0 또는 1 — 키/스크롤바가 영향을 미치는 페인 */
+    BOOL           split_active;    /* 분할 보기 토글 (Alt+1) */
     int            max_line_px;     /* 가장 긴 줄의 픽셀 폭 */
 
     /* 폰트/렌더링 */
@@ -179,6 +191,10 @@ typedef struct {
 
     /* 다크 모드 */
     BOOL           dark_mode;
+
+    /* 한자 음 표시 (보기 메뉴 토글) — 렌더 직전 1:1 한자→한글 치환.
+     * 원본 텍스트(g_state.text)는 그대로, 검색/선택은 원본 기준. */
+    BOOL           hanja_show;
 
     /* 책갈피 (Ctrl+B / F2 / Shift+F2) — 줄 번호 정렬 보관 */
     int            bookmarks[MAX_BOOKMARKS];
@@ -257,6 +273,7 @@ static BOOL has_selection(void);
 static void selection_clear(void);
 static int  line_for_offset(int offset);
 static BOOL bookmark_has(int line);
+static int  gutter_pixel_width(void);
 
 /* ------------------------------------------------------------------
  * 유틸리티
@@ -703,10 +720,69 @@ static int gutter_pixel_width(void) {
     return (digits + 2) * unit;
 }
 
-/* 텍스트 영역 가용 폭 (거터 + 좌측 여백 제외) */
-static int text_area_width(void) {
-    int w = g_state.client_w - gutter_pixel_width() - g_state.margin_left_px;
+/* ------------------------------------------------------------------
+ * 분할 보기 페인 좌표.
+ *
+ * 비분할 시 페인 0이 클라이언트 영역 전체를 차지. 분할 시 가운데
+ * 디바이더(SPLIT_DIVIDER_PX)를 두고 좌/우로 균등 분할.
+ * 거터/여백/wrap 계산은 모두 페인 단위로 수행.
+ * ------------------------------------------------------------------ */
+static int pane_x_left(int idx) {
+    if (!g_state.split_active) return 0;
+    int mid = g_state.client_w / 2;
+    int half = SPLIT_DIVIDER_PX / 2;
+    return (idx == 0) ? 0 : (mid + half);
+}
+
+static int pane_x_right(int idx) {
+    if (!g_state.split_active) return g_state.client_w;
+    int mid = g_state.client_w / 2;
+    int half = SPLIT_DIVIDER_PX / 2;
+    return (idx == 0) ? (mid - half) : g_state.client_w;
+}
+
+static int pane_width(int idx) {
+    int w = pane_x_right(idx) - pane_x_left(idx);
     return w > 0 ? w : 0;
+}
+
+static int pane_top_line(int idx) {
+    return idx == 1 ? g_state.top_line2 : g_state.top_line;
+}
+
+static void set_pane_top_line(int idx, int v) {
+    if (idx == 1) g_state.top_line2 = v;
+    else          g_state.top_line  = v;
+}
+
+static int pane_h_scroll(int idx) {
+    return idx == 1 ? g_state.h_scroll_px2 : g_state.h_scroll_px;
+}
+
+static void set_pane_h_scroll(int idx, int v) {
+    if (idx == 1) g_state.h_scroll_px2 = v;
+    else          g_state.h_scroll_px  = v;
+}
+
+static int pane_text_area_width(int idx) {
+    int w = pane_width(idx) - gutter_pixel_width() - g_state.margin_left_px;
+    return w > 0 ? w : 0;
+}
+
+/* 클라이언트 X 좌표 → 페인 인덱스. 디바이더 위면 -1. */
+static int pane_at_x(int mx) {
+    if (!g_state.split_active) return 0;
+    int mid = g_state.client_w / 2;
+    int half = SPLIT_DIVIDER_PX / 2;
+    if (mx <  mid - half) return 0;
+    if (mx >= mid + half) return 1;
+    return -1;
+}
+
+/* 텍스트 영역 가용 폭 — wrap 계산은 active 페인 기준.
+ * (분할 시 두 페인이 동일 폭이라 양쪽 모두 같은 wrap 적용 가능) */
+static int text_area_width(void) {
+    return pane_text_area_width(g_state.active_pane);
 }
 
 /* 줄 사이 간격 포함 한 줄 총 높이 */
@@ -719,22 +795,23 @@ static int line_total_height(void) {
  * 스크롤바 업데이트
  * ------------------------------------------------------------------ */
 static void update_scrollbars(void) {
-    /* 세로: 줄 단위 */
+    int idx = g_state.active_pane;
+    /* 세로: 줄 단위 — active 페인 기준 */
     SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS };
     si.nMin = 0;
     si.nMax = g_state.line_count > 0 ? g_state.line_count - 1 : 0;
     si.nPage = g_state.visible_lines > 0 ? g_state.visible_lines : 1;
-    si.nPos = g_state.top_line;
+    si.nPos = pane_top_line(idx);
     SetScrollInfo(g_state.hwnd, SB_VERT, &si, TRUE);
 
-    /* 가로: 평균 글자 폭 단위, 거터 제외 */
+    /* 가로: 평균 글자 폭 단위, 거터 제외 — active 페인 기준 */
     int unit = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
-    int avail = text_area_width();
+    int avail = pane_text_area_width(idx);
     SCROLLINFO sh = { sizeof(sh), SIF_RANGE | SIF_PAGE | SIF_POS };
     sh.nMin = 0;
     sh.nMax = g_state.max_line_px / unit;
     sh.nPage = avail / unit;
-    sh.nPos = g_state.h_scroll_px / unit;
+    sh.nPos = pane_h_scroll(idx) / unit;
     SetScrollInfo(g_state.hwnd, SB_HORZ, &sh, TRUE);
 }
 
@@ -859,61 +936,109 @@ static void reload_with_encoding(Encoding enc) {
  * 깜빡임 방지: 큰 영역 무효화 시에만 더블 버퍼링이 필요한데,
  * 줄 단위 스크롤은 ScrollWindowEx가 자동 처리하므로 필요 없음.
  * ------------------------------------------------------------------ */
-static void on_paint(HWND hwnd) {
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-    const Theme *th = theme();
+/* ------------------------------------------------------------------
+ * 한자 음 표시 — 라인 사본에 CJK 한자만 한글 음으로 치환.
+ *
+ * 1글자 → 1글자 치환이라 길이/wrap/측정 모두 영향 없음.
+ * 검색·선택 위치는 원본 오프셋을 그대로 쓰면 됨 (사본도 같은 인덱스).
+ *
+ * 반환: 사용할 wchar_t 버퍼 포인터.
+ *   hanja_show=OFF면 원본 포인터 그대로 (복사 없음).
+ *   hanja_show=ON이고 짧은 라인이면 stack_buf 사용, 길면 *out_alloc에 malloc 할당.
+ *   호출자는 *out_alloc != NULL이면 free() 책임.
+ * ------------------------------------------------------------------ */
+static const wchar_t *line_render_buf(int ls, int len,
+                                       wchar_t *stack_buf, int stack_cap,
+                                       wchar_t **out_alloc) {
+    *out_alloc = NULL;
+    if (!g_state.hanja_show) return &g_state.text[ls];
 
-    /* 배경 — 테마 색 (시스템 색 무시) */
+    wchar_t *buf;
+    if (len <= stack_cap) {
+        buf = stack_buf;
+    } else {
+        buf = (wchar_t*)malloc((size_t)len * sizeof(wchar_t));
+        if (!buf) return &g_state.text[ls];   /* 메모리 부족 시 원본 폴백 */
+        *out_alloc = buf;
+    }
+
+    for (int i = 0; i < len; i++) {
+        wchar_t c = g_state.text[ls + i];
+        if (is_cjk(c)) {
+            wchar_t h = hanja_to_hangul(c);
+            buf[i] = h ? h : c;
+        } else {
+            buf[i] = c;
+        }
+    }
+    return buf;
+}
+
+/* ------------------------------------------------------------------
+ * 한 페인 그리기 — 분할 보기 시 두 번 호출됨.
+ *
+ * 좌표 기준은 클라이언트 영역 전체. 페인 인덱스로 x 좌표 오프셋과
+ * top_line/h_scroll을 결정. 선택/검색 하이라이트는 전역(텍스트 오프셋
+ * 기준)이라 두 페인 모두에서 동일하게 그려짐.
+ * ------------------------------------------------------------------ */
+static void paint_pane(HDC hdc, int pane_idx, const RECT *rcPaint) {
+    const Theme *th = theme();
+    int px0 = pane_x_left(pane_idx);
+    int px1 = pane_x_right(pane_idx);
+
+    RECT pr = { px0, 0, px1, g_state.client_h };
+    RECT clip;
+    if (!IntersectRect(&clip, &pr, rcPaint)) return;
+
+    /* 페인 배경 */
     HBRUSH bg_brush = CreateSolidBrush(th->bg);
-    FillRect(hdc, &ps.rcPaint, bg_brush);
+    FillRect(hdc, &clip, bg_brush);
     DeleteObject(bg_brush);
 
     if (!g_state.text || g_state.line_count == 0) {
-        const wchar_t *msg = L"파일을 드래그하거나 Ctrl+O로 여세요.";
-        HFONT old = (HFONT)SelectObject(hdc, g_state.font);
-        SetTextColor(hdc, th->dim_fg);
-        SetBkMode(hdc, TRANSPARENT);
-        TextOutW(hdc, 20, 20, msg, (int)wcslen(msg));
-        SelectObject(hdc, old);
-        EndPaint(hwnd, &ps);
+        if (pane_idx == 0) {
+            const wchar_t *msg = L"파일을 드래그하거나 Ctrl+O로 여세요.";
+            HFONT old = (HFONT)SelectObject(hdc, g_state.font);
+            SetTextColor(hdc, th->dim_fg);
+            SetBkMode(hdc, TRANSPARENT);
+            TextOutW(hdc, px0 + 20, 20, msg, (int)wcslen(msg));
+            SelectObject(hdc, old);
+        }
         return;
     }
+
+    int top_line = pane_top_line(pane_idx);
+    int h_scroll = pane_h_scroll(pane_idx);
+    int gutter   = gutter_pixel_width();
+    int lh       = line_total_height();
+    int cextra   = g_state.char_spacing_extra;
+    int mtop     = g_state.margin_top_px;
 
     HFONT old = (HFONT)SelectObject(hdc, g_state.font);
     SetBkMode(hdc, TRANSPARENT);
 
-    int gutter = gutter_pixel_width();
-    int lh     = line_total_height();
-    int cextra = g_state.char_spacing_extra;
-    int mtop   = g_state.margin_top_px;
-
-    /* 가시 영역 줄 범위 — 상단 여백을 빼서 줄 인덱스 변환 */
-    int rel_top    = ps.rcPaint.top    - mtop;
-    int rel_bottom = ps.rcPaint.bottom - mtop;
-    int first = (rel_top    < 0) ? g_state.top_line :
-                (rel_top    / lh + g_state.top_line);
-    int last  = (rel_bottom < 0) ? g_state.top_line :
-                (rel_bottom / lh + g_state.top_line + 1);
+    /* 가시 영역 줄 범위 — 페인의 클립 기준 */
+    int rel_top    = clip.top    - mtop;
+    int rel_bottom = clip.bottom - mtop;
+    int first = (rel_top    < 0) ? top_line : (rel_top    / lh + top_line);
+    int last  = (rel_bottom < 0) ? top_line : (rel_bottom / lh + top_line + 1);
     if (first < 0) first = 0;
     if (last > g_state.line_count) last = g_state.line_count;
 
-    /* 본문 — 거터 만큼 클리핑하여 가로 스크롤한 텍스트가
-     * 거터 영역으로 새지 않게 함. SaveDC/RestoreDC로 클립 영역 복원. */
+    /* 본문 — 페인 텍스트 영역으로 클리핑 */
     int saved = SaveDC(hdc);
-    IntersectClipRect(hdc, gutter + g_state.margin_left_px, mtop,
-                      g_state.client_w, g_state.client_h);
+    IntersectClipRect(hdc, px0 + gutter + g_state.margin_left_px, mtop,
+                      px1, g_state.client_h);
     SetTextColor(hdc, th->fg);
     SetTextCharacterExtra(hdc, cextra);
-    int x0 = gutter + g_state.margin_left_px - g_state.h_scroll_px;
+    int x0 = px0 + gutter + g_state.margin_left_px - h_scroll;
 
     for (int i = first; i < last; i++) {
-        int y = mtop + (i - g_state.top_line) * lh;
+        int y = mtop + (i - top_line) * lh;
         int start = g_state.line_offsets[i];
         int end   = g_state.line_offsets[i + 1];
         int len = end - start;
 
-        /* 줄 종결자 제거 */
         while (len > 0) {
             wchar_t c = g_state.text[start + len - 1];
             if (c == L'\r' || c == L'\n') len--;
@@ -921,14 +1046,15 @@ static void on_paint(HWND hwnd) {
         }
 
         if (len > 0) {
-            ExtTextOutW(hdc, x0, y, 0, NULL,
-                        &g_state.text[start], len, NULL);
+            wchar_t sbuf[256];
+            wchar_t *alloc = NULL;
+            const wchar_t *r = line_render_buf(start, len, sbuf, 256, &alloc);
+            ExtTextOutW(hdc, x0, y, 0, NULL, r, len, NULL);
+            free(alloc);
         }
     }
 
-    /* 선택 영역 하이라이트 — 본문 위에 줄별로 덮어 그림.
-     * 다중 줄 선택 가능. 매칭 하이라이트보다 먼저 그려서
-     * 검색 결과가 선택 위에 보이도록 함. */
+    /* 선택 영역 하이라이트 */
     if (has_selection()) {
         int sel_s = selection_start();
         int sel_e = selection_end();
@@ -949,31 +1075,32 @@ static void on_paint(HWND hwnd) {
             int local_e = (sel_e < ls + len_text) ?
                           (sel_e - ls) : len_text;
             if (local_e <= local_s) continue;
+
+            wchar_t sbuf[256];
+            wchar_t *alloc = NULL;
+            const wchar_t *r = line_render_buf(ls, len_text, sbuf, 256, &alloc);
+
             SIZE pre_sz, sel_sz;
-            GetTextExtentPoint32W(hdc, &g_state.text[ls],
-                                  local_s, &pre_sz);
-            GetTextExtentPoint32W(hdc, &g_state.text[ls + local_s],
+            GetTextExtentPoint32W(hdc, r, local_s, &pre_sz);
+            GetTextExtentPoint32W(hdc, &r[local_s],
                                   local_e - local_s, &sel_sz);
             int pre_w = pre_sz.cx + local_s * cextra;
             int sel_w = sel_sz.cx + (local_e - local_s) * cextra;
             int sx = x0 + pre_w;
-            int sy = mtop + (i - g_state.top_line) * lh;
+            int sy = mtop + (i - top_line) * lh;
             RECT rs;
             rs.left   = sx;
             rs.top    = sy;
             rs.right  = sx + sel_w;
             rs.bottom = sy + lh;
             ExtTextOutW(hdc, sx, sy, ETO_OPAQUE, &rs,
-                        &g_state.text[ls + local_s],
-                        local_e - local_s, NULL);
+                        &r[local_s], local_e - local_s, NULL);
+            free(alloc);
         }
         SetBkMode(hdc, TRANSPARENT);
     }
 
-    /* 검색 매칭 하이라이트 — 같은 클립 영역 안에서 본문 위에 덮어 그림.
-     * 매칭이 줄바꿈을 가로지르면 그리지 않음(드문 경우).
-     * GetTextExtentPoint32W는 SetTextCharacterExtra를 반영하지 않으므로
-     * len * cextra를 수동으로 더해 정확한 픽셀 위치를 구함. */
+    /* 검색 매칭 하이라이트 */
     if (g_state.search_match_pos >= 0 && g_state.search_needle_len > 0) {
         int mp = g_state.search_match_pos;
         int mline = line_for_offset(mp);
@@ -982,12 +1109,17 @@ static void on_paint(HWND hwnd) {
             int le = g_state.line_offsets[mline + 1];
             int mlen = g_state.search_needle_len;
             if (mp >= ls && mp + mlen <= le) {
+                int line_len = le - ls;
+                wchar_t sbuf[256];
+                wchar_t *alloc = NULL;
+                const wchar_t *r = line_render_buf(ls, line_len,
+                                                    sbuf, 256, &alloc);
                 SIZE pre, mw;
-                GetTextExtentPoint32W(hdc, &g_state.text[ls], mp - ls, &pre);
-                GetTextExtentPoint32W(hdc, &g_state.text[mp], mlen, &mw);
+                GetTextExtentPoint32W(hdc, r, mp - ls, &pre);
+                GetTextExtentPoint32W(hdc, &r[mp - ls], mlen, &mw);
                 int pre_cx = pre.cx + (mp - ls) * cextra;
                 int mw_cx  = mw.cx  + mlen * cextra;
-                int my = mtop + (mline - g_state.top_line) * lh;
+                int my = mtop + (mline - top_line) * lh;
                 int mx = x0 + pre_cx;
                 RECT rh;
                 rh.left   = mx;
@@ -998,21 +1130,22 @@ static void on_paint(HWND hwnd) {
                 SetBkColor(hdc, th->hl_bg);
                 SetTextColor(hdc, th->hl_fg);
                 ExtTextOutW(hdc, mx, my, ETO_OPAQUE, &rh,
-                            &g_state.text[mp], mlen, NULL);
+                            &r[mp - ls], mlen, NULL);
                 SetBkMode(hdc, TRANSPARENT);
+                free(alloc);
             }
         }
     }
 
     RestoreDC(hdc, saved);
 
-    /* 거터 — 본문 위에 덮어 그림. 줄 번호는 자간 영향 받지 않음. */
+    /* 거터 — 페인 좌측에 덮어 그림 */
     if (gutter > 0) {
         RECT gr;
-        gr.left   = 0;
-        gr.top    = ps.rcPaint.top;
-        gr.right  = gutter;
-        gr.bottom = ps.rcPaint.bottom;
+        gr.left   = px0;
+        gr.top    = clip.top;
+        gr.right  = px0 + gutter;
+        gr.bottom = clip.bottom;
         HBRUSH gb = CreateSolidBrush(th->gutter_bg);
         FillRect(hdc, &gr, gb);
         DeleteObject(gb);
@@ -1023,21 +1156,50 @@ static void on_paint(HWND hwnd) {
             int doc = g_state.render_to_doc[i];
             BOOL first_render =
                 (i == 0) || (g_state.render_to_doc[i - 1] != doc);
-            int y = mtop + (i - g_state.top_line) * lh;
-            if (!first_render) continue;   /* wrap 중간 행은 번호 없음 */
+            int y = mtop + (i - top_line) * lh;
+            if (!first_render) continue;
 
             wchar_t numbuf[16];
             int len = _snwprintf_s(numbuf, 16, _TRUNCATE, L"%d", doc + 1);
             SIZE sz;
             GetTextExtentPoint32W(hdc, numbuf, len, &sz);
-            int x = gutter - sz.cx - unit;
-            if (x < 0) x = 0;
+            int x = px0 + gutter - sz.cx - unit;
+            if (x < px0) x = px0;
             SetTextColor(hdc, bookmark_has(doc) ? th->bm_fg : th->gutter_fg);
             ExtTextOutW(hdc, x, y, 0, NULL, numbuf, len, NULL);
         }
     }
 
     SelectObject(hdc, old);
+}
+
+static void on_paint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+
+    paint_pane(hdc, 0, &ps.rcPaint);
+
+    if (g_state.split_active) {
+        const Theme *th = theme();
+        int mid  = g_state.client_w / 2;
+        int half = SPLIT_DIVIDER_PX / 2;
+
+        /* 디바이더 — active 페인 쪽 절반을 강조색으로 칠해 표시 */
+        RECT dr_left  = { mid - half, 0, mid,         g_state.client_h };
+        RECT dr_right = { mid,        0, mid + half,  g_state.client_h };
+        RECT clip;
+        HBRUSH base = CreateSolidBrush(th->gutter_bg);
+        HBRUSH accent = CreateSolidBrush(th->bm_fg);
+        if (IntersectRect(&clip, &dr_left, &ps.rcPaint))
+            FillRect(hdc, &clip, g_state.active_pane == 0 ? accent : base);
+        if (IntersectRect(&clip, &dr_right, &ps.rcPaint))
+            FillRect(hdc, &clip, g_state.active_pane == 1 ? accent : base);
+        DeleteObject(base);
+        DeleteObject(accent);
+
+        paint_pane(hdc, 1, &ps.rcPaint);
+    }
+
     EndPaint(hwnd, &ps);
 }
 
@@ -1045,21 +1207,23 @@ static void on_paint(HWND hwnd) {
  * 스크롤 처리
  * ------------------------------------------------------------------ */
 static void scroll_to_line(int line) {
+    int idx = g_state.active_pane;
     if (line < 0) line = 0;
     int max_top = g_state.line_count - g_state.visible_lines;
     if (max_top < 0) max_top = 0;
     if (line > max_top) line = max_top;
 
-    int delta = line - g_state.top_line;
+    int cur = pane_top_line(idx);
+    int delta = line - cur;
     if (delta == 0) return;
 
-    g_state.top_line = line;
-    /* ScrollWindowEx로 부드럽게 — 새 영역만 다시 그림.
+    set_pane_top_line(idx, line);
+    /* ScrollWindowEx로 부드럽게 — 활성 페인 영역만 다시 그림.
      * 상단 여백은 고정이어야 하므로 mtop 아래만 스크롤. */
     RECT rc;
-    rc.left   = 0;
+    rc.left   = pane_x_left(idx);
     rc.top    = g_state.margin_top_px;
-    rc.right  = g_state.client_w;
+    rc.right  = pane_x_right(idx);
     rc.bottom = g_state.client_h;
     ScrollWindowEx(g_state.hwnd, 0, -delta * line_total_height(),
                    &rc, &rc, NULL, NULL,
@@ -1068,21 +1232,23 @@ static void scroll_to_line(int line) {
 }
 
 static void scroll_h_to(int px) {
+    int idx = g_state.active_pane;
     if (px < 0) px = 0;
-    int max_h = g_state.max_line_px - text_area_width();
+    int max_h = g_state.max_line_px - pane_text_area_width(idx);
     if (max_h < 0) max_h = 0;
     if (px > max_h) px = max_h;
 
-    int delta = px - g_state.h_scroll_px;
+    int cur = pane_h_scroll(idx);
+    int delta = px - cur;
     if (delta == 0) return;
 
-    g_state.h_scroll_px = px;
+    set_pane_h_scroll(idx, px);
     /* 거터/좌측 여백은 가로 스크롤 시 고정. 텍스트 영역만 ScrollWindowEx. */
     int gutter = gutter_pixel_width();
     RECT rc;
-    rc.left   = gutter + g_state.margin_left_px;
+    rc.left   = pane_x_left(idx) + gutter + g_state.margin_left_px;
     rc.top    = 0;
-    rc.right  = g_state.client_w;
+    rc.right  = pane_x_right(idx);
     rc.bottom = g_state.client_h;
     ScrollWindowEx(g_state.hwnd, -delta, 0,
                    &rc, &rc, NULL, NULL,
@@ -1253,8 +1419,14 @@ static int line_offset_at_x(int line, int x_target) {
     }
     int fit = 0;
     SIZE sz;
-    GetTextExtentExPointW(hdc, &g_state.text[ls], len, INT_MAX,
+    /* hanja_show 모드면 화면에 그려진 한글 사본 기준으로 측정해야
+     * 클릭 위치가 시각적으로 일치 */
+    wchar_t sbuf[256];
+    wchar_t *alloc = NULL;
+    const wchar_t *measure = line_render_buf(ls, len, sbuf, 256, &alloc);
+    GetTextExtentExPointW(hdc, measure, len, INT_MAX,
                           &fit, widths, &sz);
+    free(alloc);
 
     int col = len;  /* 끝까지 다 지나면 줄 끝 */
     for (int i = 0; i < len; i++) {
@@ -1274,14 +1446,17 @@ static int line_offset_at_x(int line, int x_target) {
 
 static int offset_at_mouse(int mx, int my) {
     if (g_state.line_count == 0) return 0;
+    int pane = pane_at_x(mx);
+    if (pane < 0) pane = g_state.active_pane;   /* 디바이더 위 — 현재 페인 */
+
     int rel_y = my - g_state.margin_top_px;
     if (rel_y < 0) rel_y = 0;
-    int line = rel_y / line_total_height() + g_state.top_line;
+    int line = rel_y / line_total_height() + pane_top_line(pane);
     if (line < 0) line = 0;
     if (line >= g_state.line_count) line = g_state.line_count - 1;
 
-    int x_target = mx - gutter_pixel_width() - g_state.margin_left_px
-                   + g_state.h_scroll_px;
+    int x_target = mx - pane_x_left(pane) - gutter_pixel_width()
+                 - g_state.margin_left_px + pane_h_scroll(pane);
     return line_offset_at_x(line, x_target);
 }
 
@@ -1699,20 +1874,34 @@ static void cmd_toggle_dark_mode(void) {
  * (wrap 모드일 때만 재구축이 필요하므로 wrap_mode 체크는 호출자에서).
  * ------------------------------------------------------------------ */
 static void rebuild_render_lines_preserve(void) {
-    int top_doc = 0;
+    /* 두 페인의 top_line을 doc 좌표로 변환해 보존 — render line index는
+     * wrap 재계산으로 바뀌지만 doc line index는 안정적이라 안전. */
+    int top_doc1 = 0, top_doc2 = 0;
     if (g_state.line_count > 0 && g_state.render_to_doc) {
-        top_doc = g_state.render_to_doc[g_state.top_line];
+        int t1 = g_state.top_line;
+        int t2 = g_state.top_line2;
+        if (t1 < 0) t1 = 0;
+        if (t1 >= g_state.line_count) t1 = g_state.line_count - 1;
+        if (t2 < 0) t2 = 0;
+        if (t2 >= g_state.line_count) t2 = g_state.line_count - 1;
+        top_doc1 = g_state.render_to_doc[t1];
+        top_doc2 = g_state.render_to_doc[t2];
     }
 
     if (!build_render_lines()) return;
 
     if (g_state.line_count > 0) {
-        if (top_doc < 0) top_doc = 0;
-        if (top_doc >= g_state.doc_line_count)
-            top_doc = g_state.doc_line_count - 1;
-        g_state.top_line = g_state.doc_to_render[top_doc];
+        if (top_doc1 < 0) top_doc1 = 0;
+        if (top_doc1 >= g_state.doc_line_count)
+            top_doc1 = g_state.doc_line_count - 1;
+        if (top_doc2 < 0) top_doc2 = 0;
+        if (top_doc2 >= g_state.doc_line_count)
+            top_doc2 = g_state.doc_line_count - 1;
+        g_state.top_line  = g_state.doc_to_render[top_doc1];
+        g_state.top_line2 = g_state.doc_to_render[top_doc2];
     } else {
-        g_state.top_line = 0;
+        g_state.top_line  = 0;
+        g_state.top_line2 = 0;
     }
 
     /* visible_lines, scrollbar 갱신 */
@@ -1722,7 +1911,8 @@ static void rebuild_render_lines_preserve(void) {
 
     measure_max_line_width();
     /* h_scroll 클램프 (wrap on 시 max_line_px=0) */
-    if (g_state.h_scroll_px > 0) g_state.h_scroll_px = 0;
+    if (g_state.h_scroll_px  > 0) g_state.h_scroll_px  = 0;
+    if (g_state.h_scroll_px2 > 0) g_state.h_scroll_px2 = 0;
     update_scrollbars();
     InvalidateRect(g_state.hwnd, NULL, TRUE);
 }
@@ -1737,6 +1927,62 @@ static void cmd_toggle_wrap(void) {
                                       MF_CHECKED : MF_UNCHECKED));
     }
     rebuild_render_lines_preserve();
+}
+
+/* ------------------------------------------------------------------
+ * 한자 음 표시 토글 (보기 메뉴).
+ *
+ * 원본 텍스트는 그대로, 렌더 직전에만 1:1로 한자→한글 치환.
+ * 검색/선택은 원본 기준이라 영향 없음. wrap도 cell width 동일하므로
+ * 재구성 불필요. 그리기만 다시 요청.
+ * ------------------------------------------------------------------ */
+static void cmd_toggle_hanja(void) {
+    g_state.hanja_show = !g_state.hanja_show;
+    HMENU menu = GetMenu(g_state.hwnd);
+    if (!menu) menu = g_state.fs_menu;
+    if (menu) {
+        CheckMenuItem(menu, IDM_HANJA,
+                      MF_BYCOMMAND | (g_state.hanja_show ?
+                                      MF_CHECKED : MF_UNCHECKED));
+    }
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+/* ------------------------------------------------------------------
+ * 두 쪽 보기 (분할) 토글 — Alt+1.
+ *
+ * 활성화: pane 1을 pane 0과 같은 위치로 동기화. 두 페인 모두 같은
+ * 문서를 보지만 독립 스크롤. wrap 모드에서는 페인 폭이 절반으로
+ * 줄어드므로 render line을 재구성.
+ * 비활성화: active_pane을 0으로 리셋, wrap 시 전폭으로 다시 구성.
+ * ------------------------------------------------------------------ */
+static void cmd_toggle_split(void) {
+    g_state.split_active = !g_state.split_active;
+    if (g_state.split_active) {
+        g_state.top_line2    = g_state.top_line;
+        g_state.h_scroll_px2 = g_state.h_scroll_px;
+    } else {
+        g_state.active_pane = 0;
+    }
+
+    HMENU menu = GetMenu(g_state.hwnd);
+    if (!menu) menu = g_state.fs_menu;
+    if (menu) {
+        CheckMenuItem(menu, IDM_SPLIT,
+                      MF_BYCOMMAND | (g_state.split_active ?
+                                      MF_CHECKED : MF_UNCHECKED));
+    }
+
+    /* wrap 모드면 페인 폭 변경에 맞춰 render line 재구성 */
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        /* 비-wrap에서는 max_line_px가 doc 기준이라 그대로 유효.
+         * h_scroll만 새 페인 폭에 맞춰 클램프. */
+        scroll_h_to(pane_h_scroll(g_state.active_pane));
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -1935,6 +2181,8 @@ static void settings_load(void) {
     g_state.dark_mode          = reg_get_dword(hk, L"DarkMode", 0)    ? TRUE : FALSE;
     g_state.show_line_numbers  = reg_get_dword(hk, L"LineNumbers", 0) ? TRUE : FALSE;
     g_state.wrap_mode          = reg_get_dword(hk, L"WrapMode", 0)    ? TRUE : FALSE;
+    g_state.split_active       = reg_get_dword(hk, L"SplitMode", 0)   ? TRUE : FALSE;
+    g_state.hanja_show         = reg_get_dword(hk, L"HanjaShow", 0)   ? TRUE : FALSE;
     g_state.font_size          = (int)reg_get_dword(hk, L"FontSize", 11);
     g_state.font_weight        = (LONG)reg_get_dword(hk, L"FontWeight", 0);
     g_state.font_italic        = reg_get_dword(hk, L"FontItalic", 0)  ? 1 : 0;
@@ -1974,6 +2222,8 @@ static void settings_save(void) {
     reg_set_dword(hk, L"DarkMode",     g_state.dark_mode ? 1 : 0);
     reg_set_dword(hk, L"LineNumbers",  g_state.show_line_numbers ? 1 : 0);
     reg_set_dword(hk, L"WrapMode",     g_state.wrap_mode ? 1 : 0);
+    reg_set_dword(hk, L"SplitMode",    g_state.split_active ? 1 : 0);
+    reg_set_dword(hk, L"HanjaShow",    g_state.hanja_show ? 1 : 0);
     reg_set_dword(hk, L"FontSize",     (DWORD)g_state.font_size);
     reg_set_dword(hk, L"FontWeight",   (DWORD)g_state.font_weight);
     reg_set_dword(hk, L"FontItalic",   g_state.font_italic ? 1 : 0);
@@ -2175,6 +2425,10 @@ static HMENU create_menu(void) {
                 L"다크 모드(&D)\tCtrl+D");
     AppendMenuW(view_menu, MF_STRING, IDM_WRAP,
                 L"자동 줄바꿈(&W)\tCtrl+W");
+    AppendMenuW(view_menu, MF_STRING, IDM_SPLIT,
+                L"두 쪽 보기(&2)\tAlt+1");
+    AppendMenuW(view_menu, MF_STRING, IDM_HANJA,
+                L"한자 음 표시(&H)");
     AppendMenuW(view_menu, MF_STRING, IDM_FULLSCREEN,
                 L"전체화면(&F)\tF11");
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
@@ -2243,6 +2497,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                           MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(m, IDM_WRAP,
                           MF_BYCOMMAND | (g_state.wrap_mode ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_SPLIT,
+                          MF_BYCOMMAND | (g_state.split_active ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_HANJA,
+                          MF_BYCOMMAND | (g_state.hanja_show ?
                                           MF_CHECKED : MF_UNCHECKED));
         }
         return 0;
@@ -2320,6 +2580,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetFocus(hwnd);
         int mx = (int)(short)LOWORD(lp);
         int my = (int)(short)HIWORD(lp);
+        /* 분할 시 클릭한 페인을 활성화. 디바이더 위 클릭은 무시. */
+        if (g_state.split_active) {
+            int p = pane_at_x(mx);
+            if (p < 0) return 0;
+            if (p != g_state.active_pane) {
+                g_state.active_pane = p;
+                update_scrollbars();
+            }
+        }
         int off = offset_at_mouse(mx, my);
         g_state.sel_anchor = off;
         g_state.sel_caret  = off;
@@ -2359,6 +2628,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         WORD keys = GET_KEYSTATE_WPARAM(wp);
         BOOL ctrl  = (keys & MK_CONTROL) != 0;
         BOOL shift = (keys & MK_SHIFT)   != 0;
+        /* 분할 시 휠 위치의 페인을 활성화하여 그쪽이 스크롤되게 함 */
+        if (g_state.split_active) {
+            POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+            ScreenToClient(hwnd, &pt);
+            int p = pane_at_x(pt.x);
+            if (p >= 0 && p != g_state.active_pane) {
+                g_state.active_pane = p;
+                update_scrollbars();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
         if (ctrl && shift) {
             char_spacing_change(notches);
         } else if (ctrl) {
@@ -2379,7 +2659,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_SYSKEYDOWN: {
-        /* Alt+방향키 — 여백 조절. 그 외 Alt 키는 시스템 처리 위임. */
+        /* Alt+방향키 — 여백 조절. Alt+1 — 분할 보기 토글.
+         * 그 외 Alt 키는 시스템 처리 위임. */
         BOOL alt = (lp & (1 << 29)) != 0;
         if (alt) {
             int hstep = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
@@ -2389,6 +2670,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case VK_RIGHT: margin_change_left(+hstep); return 0;
             case VK_UP:    margin_change_top(-vstep);  return 0;
             case VK_DOWN:  margin_change_top(+vstep);  return 0;
+            case '1':      cmd_toggle_split();         return 0;
             }
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2480,6 +2762,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_LINENO:      cmd_toggle_line_numbers(); break;
         case IDM_DARK_MODE:   cmd_toggle_dark_mode(); break;
         case IDM_WRAP:        cmd_toggle_wrap(); break;
+        case IDM_SPLIT:       cmd_toggle_split(); break;
+        case IDM_HANJA:       cmd_toggle_hanja(); break;
         case IDM_FULLSCREEN:  cmd_toggle_fullscreen(); break;
         case IDM_FIND:        cmd_find(); break;
         case IDM_FIND_NEXT:   cmd_find_again(TRUE); break;
