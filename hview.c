@@ -75,6 +75,11 @@
 /* 분할 보기 — 가운데 디바이더 폭 */
 #define SPLIT_DIVIDER_PX    6
 
+/* 사용자 색상 기본값 — 흰 배경 + 검은 글자 (light theme와 동일).
+ * theme.txt 파일이 손상되거나 없으면 이 값으로 복구. */
+#define HVIEW_THEME_DEFAULT_BG  RGB(255, 255, 255)
+#define HVIEW_THEME_DEFAULT_FG  RGB(  0,   0,   0)
+
 /* 메뉴 ID */
 #define IDM_OPEN            1001
 #define IDM_EXIT            1002
@@ -94,6 +99,9 @@
 #define IDM_SPLIT           1028
 #define IDM_HANJA           1029
 #define IDM_COPY            1030
+#define IDM_THEME_BG        1050
+#define IDM_THEME_FG        1051
+#define IDM_THEME_RESET     1052
 #define IDM_SELECT_ALL      1031
 #define IDM_BM_TOGGLE       1040
 #define IDM_BM_NEXT         1041
@@ -192,6 +200,12 @@ typedef struct {
     /* 다크 모드 */
     BOOL           dark_mode;
 
+    /* 사용자 색 — 메뉴(보기 → 배경색/글자색)로 변경, theme.txt에 저장.
+     * theme()이 light/dark 프리셋의 bg/fg를 이 값으로 덮어쓴다.
+     * 다크 모드 토글 시 프리셋의 bg/fg로 재설정 (예측 가능성). */
+    COLORREF       user_bg;
+    COLORREF       user_fg;
+
     /* 한자 음 표시 (보기 메뉴 토글) — 렌더 직전 1:1 한자→한글 치환.
      * 원본 텍스트(g_state.text)는 그대로, 검색/선택은 원본 기준. */
     BOOL           hanja_show;
@@ -259,8 +273,14 @@ static const Theme THEME_DARK = {
     RGB( 60,  90, 160), RGB(255, 255, 255)
 };
 
+/* 다크/라이트 프리셋 + 사용자 색(bg/fg) 오버라이드.
+ * 다른 색(거터/하이라이트/선택)은 프리셋 그대로. */
+static Theme g_theme_buf;
 static const Theme *theme(void) {
-    return g_state.dark_mode ? &THEME_DARK : &THEME_LIGHT;
+    g_theme_buf = g_state.dark_mode ? THEME_DARK : THEME_LIGHT;
+    g_theme_buf.bg = g_state.user_bg;
+    g_theme_buf.fg = g_state.user_fg;
+    return &g_theme_buf;
 }
 
 /* 전방 선언 — 정의 순서가 어긋나는 경우만 */
@@ -274,6 +294,8 @@ static void selection_clear(void);
 static int  line_for_offset(int offset);
 static BOOL bookmark_has(int line);
 static int  gutter_pixel_width(void);
+static void theme_save(void);
+static int  theme_load_or_default(void);
 
 /* ------------------------------------------------------------------
  * 유틸리티
@@ -1854,9 +1876,16 @@ static void cmd_choose_font(void) {
 
 /* ------------------------------------------------------------------
  * 다크 모드 토글
+ *
+ * 사용자 bg/fg는 토글마다 프리셋 값으로 재설정 — 라이트↔다크가 직관적.
+ * (사용자가 그 후 메뉴로 다시 색을 바꾸면 그 값이 유지됨.)
  * ------------------------------------------------------------------ */
 static void cmd_toggle_dark_mode(void) {
     g_state.dark_mode = !g_state.dark_mode;
+    g_state.user_bg = g_state.dark_mode ? THEME_DARK.bg : THEME_LIGHT.bg;
+    g_state.user_fg = g_state.dark_mode ? THEME_DARK.fg : THEME_LIGHT.fg;
+    theme_save();
+
     HMENU menu = GetMenu(g_state.hwnd);
     if (!menu) menu = g_state.fs_menu;
     if (menu) {
@@ -1864,6 +1893,41 @@ static void cmd_toggle_dark_mode(void) {
                       MF_BYCOMMAND | (g_state.dark_mode ?
                                       MF_CHECKED : MF_UNCHECKED));
     }
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+/* ------------------------------------------------------------------
+ * 사용자 색 선택 (보기 → 배경색/글자색).
+ *
+ * COMDLG32의 ChooseColorW로 표준 색 선택 다이얼로그 표시.
+ * 사용자 정의 색 16개는 정적 배열에 보관 (다이얼로그 간 유지).
+ * 확정 시 즉시 theme.txt에 저장 후 화면 갱신.
+ * ------------------------------------------------------------------ */
+static void cmd_choose_color(BOOL is_bg) {
+    static COLORREF custom_colors[16] = {
+        RGB(255,255,255), RGB(  0,  0,  0), RGB(240,240,240), RGB( 30, 30, 30),
+        RGB(220,220,220), RGB(180,210,255), RGB(255,230, 80), RGB(255,255,255),
+        RGB(255,255,255), RGB(255,255,255), RGB(255,255,255), RGB(255,255,255),
+        RGB(255,255,255), RGB(255,255,255), RGB(255,255,255), RGB(255,255,255)
+    };
+    CHOOSECOLORW cc = { sizeof(cc) };
+    cc.hwndOwner    = g_state.hwnd;
+    cc.lpCustColors = custom_colors;
+    cc.rgbResult    = is_bg ? g_state.user_bg : g_state.user_fg;
+    cc.Flags        = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR;
+
+    if (!ChooseColorW(&cc)) return;
+
+    if (is_bg) g_state.user_bg = cc.rgbResult;
+    else       g_state.user_fg = cc.rgbResult;
+    theme_save();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+static void cmd_theme_reset(void) {
+    g_state.user_bg = HVIEW_THEME_DEFAULT_BG;
+    g_state.user_fg = HVIEW_THEME_DEFAULT_FG;
+    theme_save();
     InvalidateRect(g_state.hwnd, NULL, TRUE);
 }
 
@@ -2243,6 +2307,156 @@ static void settings_save(void) {
     RegCloseKey(hk);
 }
 
+/* ------------------------------------------------------------------
+ * 사용자 색 영속화 — %APPDATA%\hview\theme.txt
+ *
+ * 형식 (ASCII, 줄당 key=R,G,B):
+ *   hview-theme v1
+ *   bg=255,255,255
+ *   fg=0,0,0
+ *
+ * 검증 규칙:
+ *   - 첫 번째 비-주석 라인은 정확히 "hview-theme v1"
+ *   - bg, fg 둘 다 필수, R/G/B는 0~255 정수
+ *   - 라인은 "key=R,G,B" 형식, key 는 bg 또는 fg 만 허용
+ *   - '#' 시작 라인과 빈 라인은 주석/스킵
+ *
+ * 위 규칙 어느 하나라도 어긋나면 즉시 기본값으로 복구하고 파일 재작성.
+ * ------------------------------------------------------------------ */
+static int theme_file_path(wchar_t *out, int cap) {
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    int w = _snwprintf_s(out, cap, _TRUNCATE,
+                         L"%s\\hview\\theme.txt", appdata);
+    return w > 0;
+}
+
+static void theme_dir_ensure(void) {
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t dir[MAX_PATH];
+    _snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%s\\hview", appdata);
+    /* 이미 존재하면 FALSE 반환 — 무시 */
+    CreateDirectoryW(dir, NULL);
+}
+
+static void theme_save(void) {
+    theme_dir_ensure();
+    wchar_t path[MAX_PATH];
+    if (!theme_file_path(path, MAX_PATH)) return;
+
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char buf[256];
+    int len = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "hview-theme v1\r\n"
+        "# Background and foreground color (R,G,B per channel, 0-255).\r\n"
+        "# Edit manually or use menu: View > Background / Foreground.\r\n"
+        "bg=%u,%u,%u\r\n"
+        "fg=%u,%u,%u\r\n",
+        GetRValue(g_state.user_bg), GetGValue(g_state.user_bg),
+        GetBValue(g_state.user_bg),
+        GetRValue(g_state.user_fg), GetGValue(g_state.user_fg),
+        GetBValue(g_state.user_fg));
+    if (len > 0) {
+        DWORD wrote = 0;
+        WriteFile(h, buf, (DWORD)len, &wrote, NULL);
+    }
+    CloseHandle(h);
+}
+
+/* 현재 라인 1개를 파싱. 성공 시 1, 실패(파일 손상) 시 0 반환.
+ * key, val_out은 line 안에서 in-place 잘라서 가리킴 (line 변경됨). */
+static int theme_parse_kv_line(char *line, COLORREF *bg, int *bg_set,
+                                COLORREF *fg, int *fg_set) {
+    char *eq = strchr(line, '=');
+    if (!eq) return 0;
+    *eq = 0;
+    const char *key = line;
+    const char *val = eq + 1;
+
+    unsigned r, g, b;
+    if (sscanf_s(val, "%u,%u,%u", &r, &g, &b) != 3) return 0;
+    if (r > 255 || g > 255 || b > 255) return 0;
+
+    COLORREF c = RGB(r, g, b);
+    if      (strcmp(key, "bg") == 0) { *bg = c; *bg_set = 1; }
+    else if (strcmp(key, "fg") == 0) { *fg = c; *fg_set = 1; }
+    else return 0;
+    return 1;
+}
+
+/* 항상 g_state.user_bg/fg를 채움. 파일이 없거나 손상이면 기본값으로
+ * 복구하고 0 반환, 정상 로드면 1. 손상 검출 시 즉시 기본값으로 재작성. */
+static int theme_load_or_default(void) {
+    g_state.user_bg = HVIEW_THEME_DEFAULT_BG;
+    g_state.user_fg = HVIEW_THEME_DEFAULT_FG;
+
+    wchar_t path[MAX_PATH];
+    if (!theme_file_path(path, MAX_PATH)) return 0;
+
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* 파일 없음 — 기본값으로 새로 생성 */
+        theme_save();
+        return 0;
+    }
+
+    char buf[2048];
+    DWORD read_n = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &read_n, NULL);
+    CloseHandle(h);
+    if (!ok || read_n == 0) goto corrupt;
+    buf[read_n] = 0;
+
+    /* 라인 단위 strict 파싱. 각 비-주석 라인은 의미가 있어야 함. */
+    int header_ok = 0;
+    int bg_set = 0, fg_set = 0;
+    COLORREF bg_v = 0, fg_v = 0;
+
+    char *p = buf;
+    while (*p) {
+        char *eol = strpbrk(p, "\r\n");
+        char saved = 0;
+        if (eol) { saved = *eol; *eol = 0; }
+
+        /* 빈 줄/주석 스킵 */
+        if (*p && *p != '#') {
+            if (!header_ok) {
+                if (strcmp(p, "hview-theme v1") != 0) goto corrupt;
+                header_ok = 1;
+            } else {
+                if (!theme_parse_kv_line(p, &bg_v, &bg_set,
+                                         &fg_v, &fg_set))
+                    goto corrupt;
+            }
+        }
+
+        if (eol) {
+            *eol = saved;
+            p = eol;
+            while (*p == '\r' || *p == '\n') p++;
+        } else break;
+    }
+
+    if (!header_ok || !bg_set || !fg_set) goto corrupt;
+
+    g_state.user_bg = bg_v;
+    g_state.user_fg = fg_v;
+    return 1;
+
+corrupt:
+    g_state.user_bg = HVIEW_THEME_DEFAULT_BG;
+    g_state.user_fg = HVIEW_THEME_DEFAULT_FG;
+    theme_save();   /* 손상된 파일을 기본값으로 덮어씀 */
+    return 0;
+}
+
 static void recent_remove(int idx) {
     if (idx < 0 || idx >= g_state.recent_count) return;
     for (int i = idx; i < g_state.recent_count - 1; i++) {
@@ -2423,6 +2637,12 @@ static HMENU create_menu(void) {
                 L"줄 번호 표시(&L)\tCtrl+L");
     AppendMenuW(view_menu, MF_STRING, IDM_DARK_MODE,
                 L"다크 모드(&D)\tCtrl+D");
+    AppendMenuW(view_menu, MF_STRING, IDM_THEME_BG,
+                L"배경색(&K)...");
+    AppendMenuW(view_menu, MF_STRING, IDM_THEME_FG,
+                L"글자색(&G)...");
+    AppendMenuW(view_menu, MF_STRING, IDM_THEME_RESET,
+                L"색상 초기화");
     AppendMenuW(view_menu, MF_STRING, IDM_WRAP,
                 L"자동 줄바꿈(&W)\tCtrl+W");
     AppendMenuW(view_menu, MF_STRING, IDM_SPLIT,
@@ -2481,6 +2701,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_state.font_size = 11;            /* 기본값 (settings_load가 덮음) */
         g_state.autoscroll_delay_ms = AUTOSCROLL_DEFAULT_MS;
         settings_load();
+        /* 사용자 색은 별도 파일(%APPDATA%\hview\theme.txt) — 손상 시 자동 복구. */
+        theme_load_or_default();
         g_state.search_match_pos = -1;
         g_state.sel_anchor = -1;
         g_state.sel_caret  = -1;
@@ -2761,6 +2983,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_GOTO:        cmd_goto_line(); break;
         case IDM_LINENO:      cmd_toggle_line_numbers(); break;
         case IDM_DARK_MODE:   cmd_toggle_dark_mode(); break;
+        case IDM_THEME_BG:    cmd_choose_color(TRUE); break;
+        case IDM_THEME_FG:    cmd_choose_color(FALSE); break;
+        case IDM_THEME_RESET: cmd_theme_reset(); break;
         case IDM_WRAP:        cmd_toggle_wrap(); break;
         case IDM_SPLIT:       cmd_toggle_split(); break;
         case IDM_HANJA:       cmd_toggle_hanja(); break;
