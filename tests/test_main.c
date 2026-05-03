@@ -382,13 +382,27 @@ TEST(detect_pure_ascii_defaults_to_cp949) {
 }
 
 TEST(detect_johab_bytes) {
-    /* '가한글힣' 조합형 — 점수 차이로 johab 우선 */
+    /* CP949 valid trail 영역(0x41~0x5A, 0x61~0x7A, 0x81~0xFE)을
+     * 모두 벗어나는 trail 바이트로 구성된 Johab 음절들.
+     *
+     * Johab 비트 구조:  code = 1<<15 | cho_bits<<10 | jung_bits<<5 | jong_bits
+     *                  trail = (jung_bits & 7) << 5 | jong_bits
+     *
+     * jung_bits=16 → 하위 3비트=0 → trail = jong_bits (1~31)
+     *   ⇒ trail ∈ 0x01~0x1F, 모두 CP949 invalid trail.
+     *
+     * 그러므로 cp949_score = 0, sjis_score = 0, johab_score = 100
+     *   → 점수 비교에서 동률 없이 ENC_JOHAB로 판별. */
     const unsigned char buf[] = {
-        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x4A, 0xD3, 0xDF,
-        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x4A, 0xD3, 0xDF,
+        0x8A, 0x01,  /* cho_bits=2(ㄱ), jung_bits=16, jong_bits=1  → 음절 */
+        0x92, 0x01,  /* cho_bits=4(ㄴ), jung_bits=16, jong_bits=1  → 음절 */
+        0x8A, 0x04,  /* cho_bits=2,    jung_bits=16, jong_bits=4  → 음절 */
+        0x92, 0x04,  /* cho_bits=4,    jung_bits=16, jong_bits=4  → 음절 */
+        0x8A, 0x08,  /* cho_bits=2,    jung_bits=16, jong_bits=8  → 음절 */
+        0x92, 0x08,  /* cho_bits=4,    jung_bits=16, jong_bits=8  → 음절 */
+        0x8A, 0x0E,  /* cho_bits=2,    jung_bits=16, jong_bits=14 → 음절 */
+        0x92, 0x0E,  /* cho_bits=4,    jung_bits=16, jong_bits=14 → 음절 */
     };
-    /* johab_score = 100, cp949_score는 (lead 0x80~ 일부) 낮음
-     * → ENC_JOHAB로 판별되어야 함 */
     Encoding got = detect_encoding(buf, sizeof(buf));
     ASSERT_EQ(got, ENC_JOHAB);
 }
