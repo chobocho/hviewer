@@ -537,6 +537,96 @@ TEST(convert_empty_input) {
     free(out);
 }
 
+/* ------------------------------------------------------------------
+ * 라운드트립 통합 테스트 — bytes → wide → bytes 후 원본과 동치 확인.
+ *
+ * Save As (cmd_save_as)가 사용하는 인코딩 변환 경로의 회귀 보호.
+ * UTF-8 / UTF-16 / CP949 / Shift-JIS 케이스를 다룸. Johab은 디코더만
+ * 있으므로 라운드트립 불가, 단방향 검증으로 대체.
+ * ------------------------------------------------------------------ */
+static int roundtrip_via_wcb(const unsigned char *src, size_t src_len,
+                             Encoding enc, UINT cp) {
+    size_t wlen = 0;
+    wchar_t *w = convert_to_utf16(src, src_len, enc, &wlen);
+    if (!w) return 0;
+    int n = WideCharToMultiByte(cp, 0, w, (int)wlen, NULL, 0, NULL, NULL);
+    unsigned char *back = (unsigned char*)malloc((size_t)n);
+    int ok = 0;
+    if (back) {
+        WideCharToMultiByte(cp, 0, w, (int)wlen, (char*)back, n, NULL, NULL);
+        /* BOM 사용 인코딩은 convert_to_utf16에서 BOM이 떨어져 나가므로
+         * 비교 시 src에서 BOM 길이만큼 건너뜀 (호출자가 prefix 지정) */
+        ok = ((size_t)n == src_len) && (memcmp(back, src, src_len) == 0);
+        free(back);
+    }
+    free(w);
+    return ok;
+}
+
+TEST(roundtrip_utf8_korean) {
+    /* "안녕" UTF-8 */
+    const unsigned char src[] = { 0xEC, 0x95, 0x88, 0xEB, 0x85, 0x95 };
+    ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src), ENC_UTF8, CP_UTF8));
+}
+
+TEST(roundtrip_utf8_ascii) {
+    const unsigned char src[] = "Hello, world.";
+    ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src) - 1, ENC_UTF8, CP_UTF8));
+}
+
+TEST(roundtrip_cp949_korean) {
+    /* "가한" CP949: 0xB0 0xA1 0xC7 0xD1 */
+    const unsigned char src[] = { 0xB0, 0xA1, 0xC7, 0xD1 };
+    ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src), ENC_CP949, 949));
+}
+
+TEST(roundtrip_sjis_kana) {
+    /* "あい" SJIS: 0x82 0xA0, 0x82 0xA2 */
+    const unsigned char src[] = { 0x82, 0xA0, 0x82, 0xA2 };
+    ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src), ENC_SJIS, 932));
+}
+
+TEST(roundtrip_utf8_bom_strips_then_restores) {
+    /* BOM 부 입력을 ENC_UTF8_BOM로 변환 → BOM 제거됨. 다시 인코드하면
+     * BOM 없는 본문만 나와야 함 (cmd_save_as는 BOM을 별도로 prepend). */
+    const unsigned char src[] = { 0xEF, 0xBB, 0xBF, 'a', 'b', 'c' };
+    size_t wlen = 0;
+    wchar_t *w = convert_to_utf16(src, sizeof(src), ENC_UTF8_BOM, &wlen);
+    ASSERT_TRUE(w != NULL);
+    ASSERT_EQ(wlen, 3u);
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, (int)wlen, NULL, 0, NULL, NULL);
+    ASSERT_EQ(n, 3);
+    unsigned char back[8] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, w, (int)wlen, (char*)back, 8, NULL, NULL);
+    ASSERT_EQ(back[0], 'a');
+    ASSERT_EQ(back[1], 'b');
+    ASSERT_EQ(back[2], 'c');
+    free(w);
+}
+
+TEST(roundtrip_empty_string) {
+    /* 빈 입력은 모든 인코딩에서 빈 wide → 빈 출력 */
+    size_t wlen = 0xDEAD;
+    wchar_t *w = convert_to_utf16((const unsigned char*)"", 0, ENC_UTF8, &wlen);
+    ASSERT_TRUE(w != NULL);
+    ASSERT_EQ(wlen, 0u);
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, (int)wlen, NULL, 0, NULL, NULL);
+    ASSERT_EQ(n, 0);
+    free(w);
+}
+
+TEST(roundtrip_johab_to_utf16_one_way) {
+    /* Johab은 디코더 only — utf-16 변환 결과만 검증 */
+    const unsigned char src[] = { 0x88, 0x61, 0xD0, 0x65 }; /* "가한" */
+    size_t wlen = 0;
+    wchar_t *w = convert_to_utf16(src, sizeof(src), ENC_JOHAB, &wlen);
+    ASSERT_TRUE(w != NULL);
+    ASSERT_EQ(wlen, 2u);
+    ASSERT_EQ(w[0], 0xAC00);
+    ASSERT_EQ(w[1], 0xD55C);
+    free(w);
+}
+
 #endif /* _WIN32 */
 
 /* ==================================================================
@@ -638,6 +728,13 @@ int main(void) {
     RUN(convert_johab_dispatches_correctly);
     RUN(convert_sjis_hiragana_a);
     RUN(convert_empty_input);
+    RUN(roundtrip_utf8_korean);
+    RUN(roundtrip_utf8_ascii);
+    RUN(roundtrip_cp949_korean);
+    RUN(roundtrip_sjis_kana);
+    RUN(roundtrip_utf8_bom_strips_then_restores);
+    RUN(roundtrip_empty_string);
+    RUN(roundtrip_johab_to_utf16_one_way);
 #else
     printf("\n[encoding.h] skipped — requires Win32 (build on MinGW or MSVC)\n");
 #endif

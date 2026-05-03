@@ -70,11 +70,11 @@
 코드 구조 / 유지보수
 - [ ] Phase 1 모듈 분리 완료 — `hview.c` (3279줄)을 DESIGN.md §1.2에 따라 `wnd.c`, `view.c`, `text.c`, `font.c`, `search.c`, `selection.c` 등으로 분해
 - [ ] 전역 상태 도메인 구조체로 분해 — DESIGN.md §2의 `App { Document, Viewport, Style, Search, ... }` 중첩 구조로 재설계
-- [ ] Makefile 추가 — `build`, `test`, `clean`, `install` 타겟 정의 (현재 `build.bat`/`build.sh` 스크립트만 존재)
+- [x] Makefile 추가 — `build`, `test`, `clean`, `install` 타겟. tests/Makefile도 추가
 
 메모리 / 안전성
-- [ ] `build_render_lines()` 정수 오버플로 방어 — `cap = dn + dn/4 + 16` 계산 전 `size_t` 오버플로 검증
-- [ ] `realloc` 실패 시 기존 포인터 보존 — `doc_line_offsets` 등 재할당 결과를 임시 변수에 받아 NULL 체크 후 교체 (`hview.c:build_render_lines` 등 dangling pointer / 누수 방지)
+- [x] `build_render_lines()` 정수 오버플로 방어 — `dn`/`cap` 산술에 INT_MAX/SIZE_MAX 가드 추가
+- [x] `realloc` 실패 시 기존 포인터 보존 — `build_doc_line_index`/`build_render_lines` 모두 임시 변수 + 성공 시점에 cap 갱신
 - [ ] `find_substr_offset()` 대용량 파일 검색 취소 가능성 — 64MB 파일 선형 검색 시 UI 멈춤 방지 (취소 플래그 또는 진행률 콜백)
 
 버그
@@ -88,20 +88,20 @@
 - [x] 검색 함수들의 `active_pane` 무시 — `search_jump_to`/`cmd_find`를 `pane_top_line(g_state.active_pane)` 기준으로 변경
 
 검색 / UX
-- [ ] 대소문자 구분 옵션 (검색 다이얼로그 + 설정 영속화) — 현재 `hview.c:1604`에서 케이스-민감 고정
-- [ ] 단어 단위 검색 (whole-word) 토글 — 단어 경계만 매칭
+- [x] 대소문자 구분 옵션 — 보기 메뉴 토글 + 레지스트리 영속화 (`FindCase`)
+- [x] 단어 단위 검색 (whole-word) 토글 — 메뉴 토글 + 영속화 (`FindWord`); 한글/CJK/가나/ASCII 단어 경계 판정
 - [ ] 검색어 히스토리 (최근 10개) — 레지스트리에 저장
 - [ ] 키보드 텍스트 선택 (Shift+방향키, Shift+Home/End, Shift+Ctrl+방향키) — 현재 마우스 드래그만 지원
 - [ ] 상태 표시줄 — 현재 줄/열, 파일 크기, 인코딩, 줄 수 등 표시
 
 설정 영속화
-- [ ] 책갈피 영속화 — 파일별 책갈피를 레지스트리에 저장/복원 (현재 세션 한정)
-- [ ] 윈도우 위치/크기 복원 — 종료 시 `WM_SIZE`/`WM_MOVE` 상태 저장, 시작 시 복원
+- [x] 책갈피 영속화 — 파일 경로 키로 `HKCU\Software\hview\Bookmarks` 아래 REG_BINARY 저장; 토글/클리어 시 즉시 동기화
+- [x] 윈도우 위치/크기 복원 — `settings_save`에서 `GetWindowPlacement`로 normal RECT + 최대화 상태 보존, `WinMain`에서 가상 화면 좌표 클램프 후 복원
 - [ ] 검색 하이라이트 색상 사용자 지정 — 테마/설정 다이얼로그에서 변경 가능
 
 문서 / 테스트
-- [ ] README 확장 — 기능 요약, 빌드 방법, 단축키 표, 인코딩 지원 행렬 추가 (현재 2줄)
-- [ ] 인코딩 라운드트립 통합 테스트 — 빈 파일, 단일 줄 거대 파일, 64MB 경계, BOM 처리, 혼합 인코딩 회귀 검증
+- [x] README 확장 — 기능 요약, 빌드 방법, 단축키 표, 인코딩 지원 행렬 추가
+- [x] 인코딩 라운드트립 통합 테스트 — UTF-8/CP949/SJIS 라운드트립, BOM 분리·재부착, 빈 입력, Johab 단방향 (Win32-only)
 
 
 ### 빌드

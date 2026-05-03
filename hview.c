@@ -55,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <wctype.h>
 
 #include "encoding.h"
 #include "hanja.h"
@@ -116,6 +117,7 @@
 #define RECENT_MAX          10
 #define RECENT_REG_PATH     L"Software\\hview\\Recent"
 #define SETTINGS_REG_PATH   L"Software\\hview\\Settings"
+#define BOOKMARKS_REG_PATH  L"Software\\hview\\Bookmarks"
 #define IDM_ENC_UTF8        1021
 #define IDM_ENC_UTF16LE     1022
 #define IDM_ENC_UTF16BE     1023
@@ -124,6 +126,8 @@
 #define IDM_ENC_SJIS        1026
 #define IDM_HELP            1089
 #define IDM_ABOUT           1090
+#define IDM_FIND_CASE       1060
+#define IDM_FIND_WORD       1061
 
 /* ------------------------------------------------------------------
  * 전역 상태
@@ -236,6 +240,10 @@ typedef struct {
     RECT           fs_rect;
     BOOL           fs_was_maximized;
 
+    /* 검색 옵션 — 메뉴 토글로 변경, 레지스트리에 영속화 */
+    BOOL           search_case_sensitive;
+    BOOL           search_whole_word;
+
     wchar_t        filepath[MAX_PATH];
 } ViewerState;
 
@@ -300,6 +308,8 @@ static const Theme *theme(void) {
 
 /* 전방 선언 — 정의 순서가 어긋나는 경우만 */
 static void recent_add(const wchar_t *path);
+static void bookmarks_load(const wchar_t *path);
+static void bookmarks_save(const wchar_t *path);
 static void rebuild_render_lines_preserve(void);
 static void autoscroll_stop(void);
 static int  selection_start(void);
@@ -585,22 +595,26 @@ static int build_doc_line_index(void) {
                 i = next;
             }
             if (g_state.doc_line_count >= g_state.doc_line_cap) {
-                g_state.doc_line_cap *= 2;
+                /* realloc 실패 시 g_state 포인터를 NULL로 덮어쓰지 않도록
+                 * 임시 변수에 받아 NULL 체크 후 교체 (dangling 방지) */
+                int new_cap = g_state.doc_line_cap * 2;
                 int *bigger = (int*)realloc(g_state.doc_line_offsets,
-                                            g_state.doc_line_cap * sizeof(int));
+                                            (size_t)new_cap * sizeof(int));
                 if (!bigger) return 0;
                 g_state.doc_line_offsets = bigger;
+                g_state.doc_line_cap = new_cap;
             }
             g_state.doc_line_offsets[g_state.doc_line_count++] = (int)(i + 1);
         }
     }
 
     if (g_state.doc_line_count >= g_state.doc_line_cap) {
-        g_state.doc_line_cap++;
+        int new_cap = g_state.doc_line_cap + 1;
         int *bigger = (int*)realloc(g_state.doc_line_offsets,
-                                    g_state.doc_line_cap * sizeof(int));
+                                    (size_t)new_cap * sizeof(int));
         if (!bigger) return 0;
         g_state.doc_line_offsets = bigger;
+        g_state.doc_line_cap = new_cap;
     }
     g_state.doc_line_offsets[g_state.doc_line_count] = (int)n;
     return 1;
@@ -656,8 +670,12 @@ static int build_render_lines(void) {
         return 1;
     }
 
-    /* wrap ON — 각 doc 라인을 cell 폭 기준으로 분할 */
+    /* wrap ON — 각 doc 라인을 cell 폭 기준으로 분할.
+     * cap 계산 정수 오버플로 방어: dn은 int, dn/4도 int,
+     * dn + dn/4 + 16이 INT_MAX를 넘지 않도록 검사. */
+    if (dn > INT_MAX - dn / 4 - 16) return 0;
     int cap = dn + dn / 4 + 16;
+    if ((size_t)cap > SIZE_MAX / sizeof(int) - 1) return 0;
     g_state.line_offsets = (int*)malloc((size_t)(cap + 1) * sizeof(int));
     g_state.render_to_doc = (int*)malloc((size_t)cap * sizeof(int));
     if (!g_state.line_offsets || !g_state.render_to_doc) return 0;
@@ -692,14 +710,19 @@ static int build_render_lines(void) {
                               (last_break + 1) : i;
                 /* render 라인 emit */
                 if (rcount + 2 > g_state.line_cap) {
-                    g_state.line_cap *= 2;
+                    /* realloc 두 번 — 둘 중 하나라도 실패하면 기존 포인터
+                     * 보존 채로 빠져나감 (NULL 덮어쓰기 방지) */
+                    int new_cap = g_state.line_cap * 2;
+                    if (new_cap <= g_state.line_cap) return 0; /* 오버플로 */
                     int *a = (int*)realloc(g_state.line_offsets,
-                                           (size_t)(g_state.line_cap + 1) * sizeof(int));
+                                           (size_t)(new_cap + 1) * sizeof(int));
+                    if (!a) return 0;
+                    g_state.line_offsets = a;
                     int *b = (int*)realloc(g_state.render_to_doc,
-                                           (size_t)g_state.line_cap * sizeof(int));
-                    if (!a || !b) return 0;
-                    g_state.line_offsets  = a;
+                                           (size_t)new_cap * sizeof(int));
+                    if (!b) return 0;
                     g_state.render_to_doc = b;
+                    g_state.line_cap = new_cap;
                 }
                 g_state.line_offsets[rcount]  = seg_start;
                 g_state.render_to_doc[rcount] = d;
@@ -971,11 +994,12 @@ static int load_file(const wchar_t *path, Encoding force_enc) {
     g_state.top_line = 0;
     g_state.h_scroll_px = 0;
     g_state.search_match_pos = -1;       /* 새 파일 → 이전 매칭 무효 */
-    g_state.bookmark_count = 0;          /* 줄 번호 의미가 달라지므로 초기화 */
+    g_state.bookmark_count = 0;          /* 새 파일 — 일단 비우고 아래에서 영속 책갈피 로드 */
     selection_clear();
     g_state.sel_dragging = FALSE;
     autoscroll_stop();                   /* 자동 스크롤 중지 */
     wcsncpy_s(g_state.filepath, MAX_PATH, path, _TRUNCATE);
+    bookmarks_load(path);
 
     if (!build_doc_line_index()) {
         show_error(g_state.hwnd, L"줄 인덱스 구축 실패.");
@@ -1602,72 +1626,102 @@ static int line_for_offset(int offset) {
 /* ------------------------------------------------------------------
  * 검색 (Ctrl+F / F3 / Shift+F3)
  *
- * 단순 substring 검색. 케이스-민감(case-sensitive) 고정.
- * - 텍스트 끝에 도달하면 처음으로 wrap-around
- * - BMP 외 surrogate pair 정확도 부족 (한글 영역엔 영향 없음)
+ * 옵션:
+ *   - search_case_sensitive: ASCII는 빠른 경로, 그 외엔 towlower 정규화
+ *   - search_whole_word: 매칭 직전/직후 글자가 단어 문자가 아니어야 함
  *
- * 향후 확장: ezView 호환 옵션(대소문자 구분 토글, 정규식)은 Phase 후속.
+ * 알고리즘: m≥2면 Boyer-Moore-Horspool, m==1은 단순 루프.
+ * 텍스트 끝에 도달하면 호출자가 처음부터 wrap-around 재시도.
+ * BMP 외 surrogate pair 정확도 부족 (한글 영역엔 영향 없음).
  * ------------------------------------------------------------------ */
-/* Boyer-Moore-Horspool — UTF-16 wchar_t 단위.
- * 시프트 테이블은 256 슬롯 (low byte). 충돌은 안전하게 1 시프트로 떨어져
- * 정확성은 유지되고 평균 케이스만 손해 — 한국어/한자 텍스트는 분포가 흩어져
- * 있어 실측상 64MB × 짧은 needle에서 단순 루프 대비 큰 폭으로 빠름.
- *
- * 역방향은 needle을 거꾸로 잡고 텍스트 끝에서 앞으로 매칭하는 방식의
- * 대칭 구조. */
+static inline wchar_t search_fold(wchar_t c) {
+    if (g_state.search_case_sensitive) return c;
+    if (c < 0x80) return (wchar_t)((c >= L'A' && c <= L'Z') ? c + 32 : c);
+    return (wchar_t)towlower(c);
+}
+
+/* 단어 문자 — ASCII 영숫자/언더스코어 + CJK 범위 + 한글.
+ * 단어 단위 검색의 경계 판정에만 사용. */
+static int is_word_char(wchar_t c) {
+    if ((c >= L'0' && c <= L'9') ||
+        (c >= L'A' && c <= L'Z') ||
+        (c >= L'a' && c <= L'z') ||
+        c == L'_') return 1;
+    if (c >= 0xAC00 && c <= 0xD7A3) return 1;        /* Hangul Syllables */
+    if (c >= 0x4E00 && c <= 0x9FFF) return 1;        /* CJK */
+    if (c >= 0x3400 && c <= 0x4DBF) return 1;        /* CJK Ext A */
+    if (c >= 0x3040 && c <= 0x30FF) return 1;        /* Kana */
+    return 0;
+}
+
+static int word_boundary_ok(int pos, int m) {
+    int n = (int)g_state.text_len;
+    if (pos > 0 && is_word_char(g_state.text[pos - 1]) &&
+                   is_word_char(g_state.text[pos])) return 0;
+    if (pos + m < n && is_word_char(g_state.text[pos + m - 1]) &&
+                       is_word_char(g_state.text[pos + m])) return 0;
+    return 1;
+}
+
 static int find_substr_offset(int start, BOOL forward) {
     if (g_state.search_needle_len == 0 || g_state.text_len == 0) return -1;
     int n = (int)g_state.text_len;
     int m = g_state.search_needle_len;
     if (m > n) return -1;
-    const wchar_t *text   = g_state.text;
-    const wchar_t *needle = g_state.search_needle;
+    const wchar_t *text = g_state.text;
 
-    /* 짧은 needle은 단순 루프가 오히려 빠르고 시프트 테이블 초기화 비용 절감 */
+    /* needle도 옵션에 맞게 한 번 정규화해 둠 */
+    wchar_t fneedle[256];
+    for (int i = 0; i < m; i++) fneedle[i] = search_fold(g_state.search_needle[i]);
+    BOOL want_word = g_state.search_whole_word;
+
     if (m == 1) {
-        wchar_t c = needle[0];
+        wchar_t c = fneedle[0];
         if (forward) {
             if (start < 0) start = 0;
-            for (int i = start; i < n; i++)
-                if (text[i] == c) return i;
+            for (int i = start; i < n; i++) {
+                if (search_fold(text[i]) == c &&
+                    (!want_word || word_boundary_ok(i, m))) return i;
+            }
         } else {
             if (start > n - 1) start = n - 1;
-            for (int i = start; i >= 0; i--)
-                if (text[i] == c) return i;
+            for (int i = start; i >= 0; i--) {
+                if (search_fold(text[i]) == c &&
+                    (!want_word || word_boundary_ok(i, m))) return i;
+            }
         }
         return -1;
     }
 
+    /* BMH 시프트 테이블 — fold된 needle 기준으로 빌드. 충돌은 안전. */
     int shift[256];
     for (int i = 0; i < 256; i++) shift[i] = m;
 
     if (forward) {
         if (start < 0) start = 0;
-        /* 마지막 글자를 제외한 needle[0..m-2]의 low byte에 (m-1-i) 시프트 */
         for (int i = 0; i < m - 1; i++)
-            shift[(unsigned)needle[i] & 0xFF] = m - 1 - i;
+            shift[(unsigned)fneedle[i] & 0xFF] = m - 1 - i;
         int i = start;
         while (i <= n - m) {
-            wchar_t c = text[i + m - 1];
-            if (c == needle[m - 1]) {
+            wchar_t c = search_fold(text[i + m - 1]);
+            if (c == fneedle[m - 1]) {
                 int k = m - 2;
-                while (k >= 0 && text[i + k] == needle[k]) k--;
-                if (k < 0) return i;
+                while (k >= 0 && search_fold(text[i + k]) == fneedle[k]) k--;
+                if (k < 0 && (!want_word || word_boundary_ok(i, m))) return i;
             }
             i += shift[(unsigned)c & 0xFF];
         }
     } else {
         if (start > n - m) start = n - m;
-        /* 역방향: needle[1..m-1]의 low byte에 i 시프트 (앞쪽으로 뛰는 거리) */
         for (int i = 1; i < m; i++)
-            shift[(unsigned)needle[i] & 0xFF] = i;
+            shift[(unsigned)fneedle[i] & 0xFF] = i;
         int i = start;
         while (i >= 0) {
-            wchar_t c = text[i];
-            if (c == needle[0]) {
+            wchar_t c = search_fold(text[i]);
+            if (c == fneedle[0]) {
                 int k = 1;
-                while (k < m && text[i + k] == needle[k]) k++;
-                if (k == m) return i;
+                while (k < m && search_fold(text[i + k]) == fneedle[k]) k++;
+                if (k == m && (!want_word || word_boundary_ok(i, m))) return i;
             }
             i -= shift[(unsigned)c & 0xFF];
         }
@@ -1897,6 +1951,7 @@ static void cmd_bookmark_toggle(void) {
         g_state.bookmarks[pos] = line;
         g_state.bookmark_count++;
     }
+    bookmarks_save(g_state.filepath);
     InvalidateRect(g_state.hwnd, NULL, FALSE);
 }
 
@@ -1930,6 +1985,7 @@ static void cmd_bookmark_jump(BOOL forward) {
 static void cmd_bookmark_clear(void) {
     if (g_state.bookmark_count == 0) return;
     g_state.bookmark_count = 0;
+    bookmarks_save(g_state.filepath);
     InvalidateRect(g_state.hwnd, NULL, FALSE);
 }
 
@@ -2338,6 +2394,63 @@ static void recent_save(void) {
     RegCloseKey(hk);
 }
 
+/* ------------------------------------------------------------------
+ * 책갈피 영속화 — HKCU\Software\hview\Bookmarks 아래 파일 경로를
+ * 값 이름으로, REG_BINARY로 int 줄 번호 배열을 저장.
+ *
+ * 키 경로(value name)에는 백슬래시가 들어가도 OK (분리자는 키 path 한정).
+ * 값 이름 길이 제한은 16383자 — MAX_PATH로 충분.
+ * ------------------------------------------------------------------ */
+static void bookmarks_load(const wchar_t *path) {
+    g_state.bookmark_count = 0;
+    if (!path || !path[0]) return;
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, BOOKMARKS_REG_PATH, 0,
+                      KEY_READ, &hk) != ERROR_SUCCESS) return;
+    DWORD type = 0, sz = sizeof(g_state.bookmarks);
+    if (RegQueryValueExW(hk, path, NULL, &type,
+                         (BYTE*)g_state.bookmarks, &sz) == ERROR_SUCCESS &&
+        type == REG_BINARY) {
+        int n = (int)(sz / sizeof(int));
+        if (n > MAX_BOOKMARKS) n = MAX_BOOKMARKS;
+        /* 정렬 가정 — 손상 시 재정렬 (insertion sort, n ≤ MAX_BOOKMARKS) */
+        for (int i = 1; i < n; i++) {
+            int v = g_state.bookmarks[i];
+            int j = i - 1;
+            while (j >= 0 && g_state.bookmarks[j] > v) {
+                g_state.bookmarks[j + 1] = g_state.bookmarks[j];
+                j--;
+            }
+            g_state.bookmarks[j + 1] = v;
+        }
+        /* 음수/중복 제거 */
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (g_state.bookmarks[i] < 0) continue;
+            if (w > 0 && g_state.bookmarks[w - 1] == g_state.bookmarks[i]) continue;
+            g_state.bookmarks[w++] = g_state.bookmarks[i];
+        }
+        g_state.bookmark_count = w;
+    }
+    RegCloseKey(hk);
+}
+
+static void bookmarks_save(const wchar_t *path) {
+    if (!path || !path[0]) return;
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, BOOKMARKS_REG_PATH, 0, NULL, 0,
+                        KEY_WRITE, NULL, &hk, NULL) != ERROR_SUCCESS) return;
+    if (g_state.bookmark_count > 0) {
+        RegSetValueExW(hk, path, 0, REG_BINARY,
+                       (const BYTE*)g_state.bookmarks,
+                       (DWORD)(g_state.bookmark_count * sizeof(int)));
+    } else {
+        /* 모두 지웠으면 레지스트리도 정리 — 최근 파일 목록과 일치하는 정신적 모델 */
+        RegDeleteValueW(hk, path);
+    }
+    RegCloseKey(hk);
+}
+
 static void recent_rebuild_menu(void) {
     HMENU m = g_state.recent_menu;
     if (!m) return;
@@ -2408,6 +2521,37 @@ static DWORD reg_get_dword(HKEY hk, const wchar_t *name, DWORD def) {
     return def;
 }
 
+/* 시작 시 사용할 윈도우 위치/크기를 레지스트리에서 읽음.
+ * 저장된 값이 없거나 화면 밖이면 0(use defaults) 반환. */
+static int settings_load_window_rect(int *x, int *y, int *w, int *h, int *maximized) {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0,
+                      KEY_READ, &hk) != ERROR_SUCCESS) return 0;
+    DWORD has = 0, sz = sizeof(has), type = 0;
+    if (RegQueryValueExW(hk, L"WinW", NULL, &type, (BYTE*)&has, &sz) != ERROR_SUCCESS) {
+        RegCloseKey(hk);
+        return 0;
+    }
+    *x = (int)reg_get_dword(hk, L"WinX", 0);
+    *y = (int)reg_get_dword(hk, L"WinY", 0);
+    *w = (int)reg_get_dword(hk, L"WinW", 900);
+    *h = (int)reg_get_dword(hk, L"WinH", 700);
+    *maximized = reg_get_dword(hk, L"WinMax", 0) ? 1 : 0;
+    RegCloseKey(hk);
+
+    /* 화면 밖이면 무효 — 모니터 구성이 바뀌었을 수 있음. SM_*를 통한
+     * 가상 화면 좌표로 클램프 (다중 모니터 환경 대응). */
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (*w < 200) *w = 200;
+    if (*h < 150) *h = 150;
+    if (*x < vx || *x > vx + vw - 100) *x = CW_USEDEFAULT;
+    if (*y < vy || *y > vy + vh - 100) *y = CW_USEDEFAULT;
+    return 1;
+}
+
 static void settings_load(void) {
     HKEY hk;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0,
@@ -2427,6 +2571,8 @@ static void settings_load(void) {
     g_state.margin_top_px      = (int)reg_get_dword(hk, L"MarginTop", 0);
     g_state.autoscroll_delay_ms = (int)reg_get_dword(hk, L"AutoscrollMs",
                                                      AUTOSCROLL_DEFAULT_MS);
+    g_state.search_case_sensitive = reg_get_dword(hk, L"FindCase", 0) ? TRUE : FALSE;
+    g_state.search_whole_word     = reg_get_dword(hk, L"FindWord", 0) ? TRUE : FALSE;
 
     DWORD type = 0;
     DWORD sz = sizeof(g_state.font_face);
@@ -2467,6 +2613,22 @@ static void settings_save(void) {
     reg_set_dword(hk, L"MarginLeft",   (DWORD)g_state.margin_left_px);
     reg_set_dword(hk, L"MarginTop",    (DWORD)g_state.margin_top_px);
     reg_set_dword(hk, L"AutoscrollMs", (DWORD)g_state.autoscroll_delay_ms);
+    reg_set_dword(hk, L"FindCase",     g_state.search_case_sensitive ? 1 : 0);
+    reg_set_dword(hk, L"FindWord",     g_state.search_whole_word ? 1 : 0);
+
+    /* 윈도우 위치/크기 — 최대화 상태이거나 최소화 상태면 normal 좌표 보존,
+     * 정상 상태면 현재 RECT. WinMain이 기동 시 복원함. */
+    if (g_state.hwnd) {
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        if (GetWindowPlacement(g_state.hwnd, &wp)) {
+            RECT r = wp.rcNormalPosition;
+            reg_set_dword(hk, L"WinX",   (DWORD)r.left);
+            reg_set_dword(hk, L"WinY",   (DWORD)r.top);
+            reg_set_dword(hk, L"WinW",   (DWORD)(r.right  - r.left));
+            reg_set_dword(hk, L"WinH",   (DWORD)(r.bottom - r.top));
+            reg_set_dword(hk, L"WinMax", (wp.showCmd == SW_SHOWMAXIMIZED) ? 1 : 0);
+        }
+    }
 
     if (g_state.font_face[0]) {
         DWORD bytes = (DWORD)((wcslen(g_state.font_face) + 1) *
@@ -2831,6 +2993,10 @@ static HMENU create_menu(void) {
                 L"다음 찾기\tF3");
     AppendMenuW(view_menu, MF_STRING, IDM_FIND_PREV,
                 L"이전 찾기\tShift+F3");
+    AppendMenuW(view_menu, MF_STRING, IDM_FIND_CASE,
+                L"대/소문자 구분(&C)");
+    AppendMenuW(view_menu, MF_STRING, IDM_FIND_WORD,
+                L"단어 단위 찾기(&W)");
     AppendMenuW(view_menu, MF_STRING, IDM_GOTO,
                 L"줄 이동(&G)...\tCtrl+G");
     AppendMenuW(view_menu, MF_STRING, IDM_SHOW_TOC,
@@ -2900,6 +3066,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                           MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(m, IDM_HANJA,
                           MF_BYCOMMAND | (g_state.hanja_show ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_FIND_CASE,
+                          MF_BYCOMMAND | (g_state.search_case_sensitive ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_FIND_WORD,
+                          MF_BYCOMMAND | (g_state.search_whole_word ?
                                           MF_CHECKED : MF_UNCHECKED));
         }
         return 0;
@@ -3182,6 +3354,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_FIND:        cmd_find(); break;
         case IDM_FIND_NEXT:   cmd_find_again(TRUE); break;
         case IDM_FIND_PREV:   cmd_find_again(FALSE); break;
+        case IDM_FIND_CASE:
+            g_state.search_case_sensitive = !g_state.search_case_sensitive;
+            CheckMenuItem(GetMenu(g_state.hwnd), IDM_FIND_CASE,
+                          MF_BYCOMMAND | (g_state.search_case_sensitive ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            break;
+        case IDM_FIND_WORD:
+            g_state.search_whole_word = !g_state.search_whole_word;
+            CheckMenuItem(GetMenu(g_state.hwnd), IDM_FIND_WORD,
+                          MF_BYCOMMAND | (g_state.search_whole_word ?
+                                          MF_CHECKED : MF_UNCHECKED));
+            break;
         case IDM_BM_TOGGLE:   cmd_bookmark_toggle(); break;
         case IDM_BM_NEXT:     cmd_bookmark_jump(TRUE); break;
         case IDM_BM_PREV:     cmd_bookmark_jump(FALSE); break;
@@ -3288,12 +3472,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
     wc.lpszClassName = L"hview_main";
     RegisterClassExW(&wc);
 
+    /* 종료 시 저장한 윈도우 좌표/크기 복원 — 없거나 모니터 구성이 바뀌어
+     * 무효한 위치면 CW_USEDEFAULT로 떨어짐 (안전한 폴백). */
+    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT, ww = 900, wh = 700;
+    int wmax = 0;
+    settings_load_window_rect(&wx, &wy, &ww, &wh, &wmax);
+
     HMENU menu = create_menu();
     HWND hwnd = CreateWindowExW(
         WS_EX_ACCEPTFILES,
         L"hview_main", APP_TITLE,
         WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 700,
+        wx, wy, ww, wh,
         NULL, menu, hInst, NULL
     );
     if (!hwnd) return 1;
@@ -3316,6 +3506,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
         }
     }
 
+    /* 저장된 상태가 최대화면 그렇게 띄움. nCmdShow가 강제 minimized 등인 경우
+     * 그쪽이 우선 (Windows shell이 주는 힌트는 존중). */
+    if (wmax && nCmdShow == SW_SHOWNORMAL) nCmdShow = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
