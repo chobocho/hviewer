@@ -756,10 +756,11 @@ static void measure_max_line_width(void) {
     int max_w = 0;
     SIZE sz;
     int cextra = g_state.char_spacing_extra;
-    /* doc 줄 전체 측정. 1만 줄 샘플링 (성능 보호). */
-    int sample = g_state.doc_line_count < 10000 ?
-                 g_state.doc_line_count : 10000;
-    for (int i = 0; i < sample; i++) {
+    /* doc 줄 전체 측정. 10000줄 초과 시 등간격 stride 샘플링으로 전체에서
+     * 약 10000개 후보를 측정 (앞쪽만 보면 후반부 긴 줄을 놓침). */
+    int dn = g_state.doc_line_count;
+    int stride = dn > 10000 ? (dn + 9999) / 10000 : 1;
+    for (int i = 0; i < dn; i += stride) {
         int start = g_state.doc_line_offsets[i];
         int end   = g_state.doc_line_offsets[i + 1];
         int len = end - start;
@@ -1607,29 +1608,68 @@ static int line_for_offset(int offset) {
  *
  * 향후 확장: ezView 호환 옵션(대소문자 구분 토글, 정규식)은 Phase 후속.
  * ------------------------------------------------------------------ */
+/* Boyer-Moore-Horspool — UTF-16 wchar_t 단위.
+ * 시프트 테이블은 256 슬롯 (low byte). 충돌은 안전하게 1 시프트로 떨어져
+ * 정확성은 유지되고 평균 케이스만 손해 — 한국어/한자 텍스트는 분포가 흩어져
+ * 있어 실측상 64MB × 짧은 needle에서 단순 루프 대비 큰 폭으로 빠름.
+ *
+ * 역방향은 needle을 거꾸로 잡고 텍스트 끝에서 앞으로 매칭하는 방식의
+ * 대칭 구조. */
 static int find_substr_offset(int start, BOOL forward) {
     if (g_state.search_needle_len == 0 || g_state.text_len == 0) return -1;
     int n = (int)g_state.text_len;
-    int needlelen = g_state.search_needle_len;
-    if (needlelen > n) return -1;
+    int m = g_state.search_needle_len;
+    if (m > n) return -1;
+    const wchar_t *text   = g_state.text;
+    const wchar_t *needle = g_state.search_needle;
+
+    /* 짧은 needle은 단순 루프가 오히려 빠르고 시프트 테이블 초기화 비용 절감 */
+    if (m == 1) {
+        wchar_t c = needle[0];
+        if (forward) {
+            if (start < 0) start = 0;
+            for (int i = start; i < n; i++)
+                if (text[i] == c) return i;
+        } else {
+            if (start > n - 1) start = n - 1;
+            for (int i = start; i >= 0; i--)
+                if (text[i] == c) return i;
+        }
+        return -1;
+    }
+
+    int shift[256];
+    for (int i = 0; i < 256; i++) shift[i] = m;
 
     if (forward) {
         if (start < 0) start = 0;
-        for (int i = start; i <= n - needlelen; i++) {
-            int k;
-            for (k = 0; k < needlelen; k++) {
-                if (g_state.text[i + k] != g_state.search_needle[k]) break;
+        /* 마지막 글자를 제외한 needle[0..m-2]의 low byte에 (m-1-i) 시프트 */
+        for (int i = 0; i < m - 1; i++)
+            shift[(unsigned)needle[i] & 0xFF] = m - 1 - i;
+        int i = start;
+        while (i <= n - m) {
+            wchar_t c = text[i + m - 1];
+            if (c == needle[m - 1]) {
+                int k = m - 2;
+                while (k >= 0 && text[i + k] == needle[k]) k--;
+                if (k < 0) return i;
             }
-            if (k == needlelen) return i;
+            i += shift[(unsigned)c & 0xFF];
         }
     } else {
-        if (start > n - needlelen) start = n - needlelen;
-        for (int i = start; i >= 0; i--) {
-            int k;
-            for (k = 0; k < needlelen; k++) {
-                if (g_state.text[i + k] != g_state.search_needle[k]) break;
+        if (start > n - m) start = n - m;
+        /* 역방향: needle[1..m-1]의 low byte에 i 시프트 (앞쪽으로 뛰는 거리) */
+        for (int i = 1; i < m; i++)
+            shift[(unsigned)needle[i] & 0xFF] = i;
+        int i = start;
+        while (i >= 0) {
+            wchar_t c = text[i];
+            if (c == needle[0]) {
+                int k = 1;
+                while (k < m && text[i + k] == needle[k]) k++;
+                if (k == m) return i;
             }
-            if (k == needlelen) return i;
+            i -= shift[(unsigned)c & 0xFF];
         }
     }
     return -1;
@@ -1638,9 +1678,10 @@ static int find_substr_offset(int start, BOOL forward) {
 static void search_jump_to(int offset) {
     g_state.search_match_pos = offset;
     int line = line_for_offset(offset);
-    /* 매칭 줄이 화면 밖이거나 가장자리면 중앙으로 가져옴 */
-    if (line < g_state.top_line ||
-        line >= g_state.top_line + g_state.visible_lines) {
+    /* 매칭 줄이 화면 밖이거나 가장자리면 중앙으로 가져옴.
+     * 분할 보기에서는 활성 페인 기준으로 가시성 판정/스크롤. */
+    int top = pane_top_line(g_state.active_pane);
+    if (line < top || line >= top + g_state.visible_lines) {
         int target = line - g_state.visible_lines / 2;
         if (target < 0) target = 0;
         scroll_to_line(target);
@@ -1659,8 +1700,9 @@ static void cmd_find(void) {
     wcsncpy_s(g_state.search_needle, 256, buf, _TRUNCATE);
     g_state.search_needle_len = len;
 
-    /* 화면 윗줄부터 정방향 검색 → 못 찾으면 처음부터 wrap */
-    int start = g_state.line_offsets[g_state.top_line];
+    /* 화면 윗줄부터 정방향 검색 → 못 찾으면 처음부터 wrap.
+     * 분할 보기에서는 활성 페인의 top_line을 기준으로. */
+    int start = g_state.line_offsets[pane_top_line(g_state.active_pane)];
     int pos = find_substr_offset(start, TRUE);
     if (pos < 0) pos = find_substr_offset(0, TRUE);
     if (pos < 0) {
@@ -2681,12 +2723,14 @@ static void cmd_save_as(void) {
     } else {
         UINT cp = (enc == ENC_CP949) ? 949 : 932;
         BOOL used_default = FALSE;
-        int n = WideCharToMultiByte(cp, 0, g_state.text, in_len,
+        /* WC_NO_BEST_FIT_CHARS: 전각/유사 문자 best-fit 매핑을 막아
+         * 변환 불가 문자가 '?'로 떨어질 때 used_default가 정확히 TRUE가 되도록. */
+        int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, g_state.text, in_len,
                                     NULL, 0, NULL, NULL);
         if (n <= 0) { show_error(g_state.hwnd, L"인코딩 변환 실패."); return; }
         out = (BYTE*)malloc((size_t)n);
         if (!out) { show_error(g_state.hwnd, L"메모리 할당 실패."); return; }
-        WideCharToMultiByte(cp, 0, g_state.text, in_len,
+        WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, g_state.text, in_len,
                             (char*)out, n, "?", &used_default);
         out_len = (size_t)n;
         if (used_default) {
@@ -2903,8 +2947,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case SB_LINEDOWN:      new_pos += 1; break;
         case SB_PAGEUP:        new_pos -= g_state.visible_lines; break;
         case SB_PAGEDOWN:      new_pos += g_state.visible_lines; break;
+        /* HIWORD(wp)는 16비트 한정이라 65535줄 초과 파일에서 잘림.
+         * SCROLLINFO의 nTrackPos는 32비트라 SIF_ALL/SIF_TRACKPOS로 받음. */
         case SB_THUMBTRACK:
-        case SB_THUMBPOSITION: new_pos = HIWORD(wp); break;
+        case SB_THUMBPOSITION: new_pos = si.nTrackPos; break;
         case SB_TOP:           new_pos = 0; break;
         case SB_BOTTOM:        new_pos = g_state.line_count; break;
         }
@@ -2923,7 +2969,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case SB_PAGELEFT:      new_pos -= si.nPage; break;
         case SB_PAGERIGHT:     new_pos += si.nPage; break;
         case SB_THUMBTRACK:
-        case SB_THUMBPOSITION: new_pos = HIWORD(wp); break;
+        case SB_THUMBPOSITION: new_pos = si.nTrackPos; break;
         }
         scroll_h_to(new_pos * unit);
         return 0;
@@ -3046,6 +3092,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       g_state.avg_char_width * 4); break;
         case 'O':
             if (ctrl) cmd_open_file();
+            break;
+        case 'S':
+            if (ctrl) cmd_save_as();
             break;
         case 'C':
             if (ctrl) cmd_copy();

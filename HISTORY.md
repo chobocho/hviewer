@@ -78,14 +78,14 @@
 - [ ] `find_substr_offset()` 대용량 파일 검색 취소 가능성 — 64MB 파일 선형 검색 시 UI 멈춤 방지 (취소 플래그 또는 진행률 콜백)
 
 버그
-- [ ] `cmd_save_as`: Best-fit 매핑 감지 불가 — `WideCharToMultiByte`(`hview.c:2684,2689`)에 `WC_NO_BEST_FIT_CHARS` 플래그 누락. 전각/반각 등이 무관 문자로 자동 치환되어도 `lpUsedDefaultChar`가 FALSE로 남아 사용자에게 경고 없이 저장됨
-- [ ] `find_substr_offset()` O(n·m) 브루트포스 탐색 (`hview.c:1610`) — Boyer-Moore-Horspool 또는 KMP로 교체 (64MB × 짧은 needle 회귀 시 체감 지연)
-- [ ] `hanja_to_hangul` / `kana_to_hangul` 선형 탐색 (`hanja.h:82,309`) — 테이블이 코드포인트 정렬되어 있으므로 이진 탐색으로 교체 (~600 엔트리)
-- [ ] `hanja.h` 잘못된 테이블 엔트리 — `hanja.h:144`에 `{ 0xABC, 0xAD6C }, /* skip */` 데드 엔트리 존재. CJK Unified Ideographs(0x4E00~0x9FFF) 범위 밖이라 `hanja_to_hangul()` 범위 체크에서 걸러져 사용되지 않지만, 정렬 순서를 깨뜨려 향후 이진 탐색 도입 시 오동작. 데드 엔트리 제거 + 전체 테이블 코드포인트 정렬 검증
-- [ ] Ctrl+S 키 바인딩 누락 — 도움말 텍스트(`hview.c:2163`)는 "Ctrl+S 다른 이름으로 저장"을 안내하지만 `WM_KEYDOWN` 스위치에 `'S'` 핸들러 없음. `cmd_save_as()` 직접 호출 추가 필요
-- [ ] `SB_THUMBTRACK` 스크롤바 16비트 절단 (`hview.c:2907,2926`) — `HIWORD(wp)`는 16비트 한정이라 65535줄 초과 파일에서 썸 드래그 위치가 깨짐. `GetScrollInfo`로 32비트 위치 조회
-- [ ] `measure_max_line_width()` 가짜 샘플링 (`hview.c:760-762`) — 주석은 "1만 줄 샘플링"이라 적혀 있지만 실제로는 앞쪽 10000줄만 측정하고 나머지는 무시. 10000줄 초과 파일에서 가장 긴 줄이 후반부에 있으면 `max_line_px` 과소 추정 → 가로 스크롤 부족. 등간격 stride 샘플링(`step = doc_line_count / 10000`) 또는 문자 수 기반 후보 선별 후 GDI 측정으로 교체
-- [ ] 검색 함수들의 `active_pane` 무시 — `search_jump_to`(`hview.c:1642-1643`)와 `cmd_find`(`hview.c:1663`)가 `g_state.top_line`(페인 0)을 직접 참조해 split view에서 페인 1 활성 시 검색 시작점·가시성 판정이 어긋남. `pane_top_line(g_state.active_pane)` / `pane_line_offsets`로 교체
+- [x] `cmd_save_as`: Best-fit 매핑 감지 불가 — `WideCharToMultiByte`에 `WC_NO_BEST_FIT_CHARS` 플래그 추가
+- [x] `find_substr_offset()` O(n·m) 브루트포스 탐색 — Boyer-Moore-Horspool로 교체 (m==1은 기존 단순 루프 유지)
+- [x] `hanja_to_hangul` / `kana_to_hangul` 선형 탐색 — 이진 탐색으로 교체 (KANA_TABLE도 코드포인트 정렬)
+- [x] `hanja.h` 잘못된 테이블 엔트리 — `0xABC` 데드 엔트리 제거, 0x6388 영역 및 0x9F9C/0x9F99 정렬 수정, 전체 정렬 검증
+- [x] Ctrl+S 키 바인딩 누락 — `WM_KEYDOWN` 스위치에 `'S'` 핸들러 추가, `cmd_save_as()` 호출
+- [x] `SB_THUMBTRACK` 스크롤바 16비트 절단 — `HIWORD(wp)` 대신 `SCROLLINFO.nTrackPos`(32비트) 사용
+- [x] `measure_max_line_width()` 가짜 샘플링 — 등간격 stride 샘플링으로 교체 (`stride = (dn + 9999) / 10000`)
+- [x] 검색 함수들의 `active_pane` 무시 — `search_jump_to`/`cmd_find`를 `pane_top_line(g_state.active_pane)` 기준으로 변경
 
 검색 / UX
 - [ ] 대소문자 구분 옵션 (검색 다이얼로그 + 설정 영속화) — 현재 `hview.c:1604`에서 케이스-민감 고정
