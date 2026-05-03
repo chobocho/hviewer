@@ -3154,7 +3154,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_ABOUT:
             MessageBoxW(hwnd,
                 L"hViewer — Win32 무료 한글 텍스트 뷰어\n"
-                L"최대 64MB, 조합형/완성형 지원",
+                L"최대 64MB, 조합형/완성형 지원\n\n"
+                L"https://github.com/chobocho/hviewer",
                 APP_TITLE, MB_OK | MB_ICONINFORMATION);
             break;
         default: {
