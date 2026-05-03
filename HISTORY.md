@@ -74,8 +74,16 @@
 
 메모리 / 안전성
 - [ ] `build_render_lines()` 정수 오버플로 방어 — `cap = dn + dn/4 + 16` 계산 전 `size_t` 오버플로 검증
-- [ ] `realloc` 실패 시 기존 포인터 보존 — `doc_line_offsets` 등 재할당 결과를 임시 변수에 받아 NULL 체크 후 교체
+- [ ] `realloc` 실패 시 기존 포인터 보존 — `doc_line_offsets` 등 재할당 결과를 임시 변수에 받아 NULL 체크 후 교체 (`hview.c:build_render_lines` 등 dangling pointer / 누수 방지)
 - [ ] `find_substr_offset()` 대용량 파일 검색 취소 가능성 — 64MB 파일 선형 검색 시 UI 멈춤 방지 (취소 플래그 또는 진행률 콜백)
+
+버그
+- [ ] `cmd_save_as`: Best-fit 매핑 감지 불가 — `WideCharToMultiByte`(`hview.c:2684,2689`)에 `WC_NO_BEST_FIT_CHARS` 플래그 누락. 전각/반각 등이 무관 문자로 자동 치환되어도 `lpUsedDefaultChar`가 FALSE로 남아 사용자에게 경고 없이 저장됨
+- [ ] `find_substr_offset()` O(n·m) 브루트포스 탐색 (`hview.c:1610`) — Boyer-Moore-Horspool 또는 KMP로 교체 (64MB × 짧은 needle 회귀 시 체감 지연)
+- [ ] `hanja_to_hangul` / `kana_to_hangul` 선형 탐색 (`hanja.h:82,309`) — 테이블이 코드포인트 정렬되어 있으므로 이진 탐색으로 교체 (~600 엔트리)
+- [ ] `hanja.h` 테이블 엔트리 검증 / 정렬 — 일부 엔트리가 코드포인트 순서를 벗어남 (예: `0x9F9C` 뒤에 `0x9F99`). 잘못된 음 매핑 일괄 점검 + 정렬
+- [ ] Ctrl+S 키 바인딩 누락 — 도움말 텍스트(`hview.c:2163`)는 "Ctrl+S 다른 이름으로 저장"을 안내하지만 `WM_KEYDOWN` 스위치에 `'S'` 핸들러 없음. `cmd_save_as()` 직접 호출 추가 필요
+- [ ] `SB_THUMBTRACK` 스크롤바 16비트 절단 (`hview.c:2907,2926`) — `HIWORD(wp)`는 16비트 한정이라 65535줄 초과 파일에서 썸 드래그 위치가 깨짐. `GetScrollInfo`로 32비트 위치 조회
 
 검색 / UX
 - [ ] 대소문자 구분 옵션 (검색 다이얼로그 + 설정 영속화) — 현재 `hview.c:1604`에서 케이스-민감 고정
