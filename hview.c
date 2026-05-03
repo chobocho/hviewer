@@ -65,7 +65,7 @@
  * ------------------------------------------------------------------ */
 #define MAX_FILE_SIZE       (64 * 1024 * 1024)   /* 64MB */
 #define INITIAL_LINE_CAP    1024
-#define APP_TITLE           L"hViewer V0.1"
+#define APP_TITLE           L"hViewer V0.1a"
 
 /* 자동 스크롤 타이머 */
 #define AUTOSCROLL_TIMER_ID 1
@@ -3249,21 +3249,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
     );
     if (!hwnd) return 1;
 
-    /* 명령행 인자로 파일 받기 */
-    if (cmdline && cmdline[0]) {
-        wchar_t path[MAX_PATH];
-        const wchar_t *src = cmdline;
-        /* 따옴표 제거 */
-        if (*src == L'"') {
-            src++;
-            int i = 0;
-            while (*src && *src != L'"' && i < MAX_PATH - 1)
-                path[i++] = *src++;
-            path[i] = 0;
-        } else {
-            wcsncpy_s(path, MAX_PATH, cmdline, _TRUNCATE);
+    /* 명령행 인자로 파일 받기 — `hview.exe foo.txt` 또는 Explorer 연결 프로그램.
+     * CommandLineToArgvW로 따옴표/공백을 표준대로 처리하고, 상대 경로는
+     * 절대 경로로 변환해 저장한다 (이후 SaveAs 등으로 cwd가 바뀌어도 안전). */
+    {
+        int argc = 0;
+        LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            if (argc >= 2 && argv[1][0]) {
+                wchar_t path[MAX_PATH];
+                if (GetFullPathNameW(argv[1], MAX_PATH, path, NULL) > 0)
+                    load_file(path, ENC_UNKNOWN);
+                else
+                    load_file(argv[1], ENC_UNKNOWN);
+            }
+            LocalFree(argv);
         }
-        if (path[0]) load_file(path, ENC_UNKNOWN);
     }
 
     ShowWindow(hwnd, nCmdShow);
