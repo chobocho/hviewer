@@ -16,6 +16,9 @@
  *
  * 키 바인딩:
  *   Ctrl+O          파일 열기
+ *   Ctrl+C          선택 영역 복사
+ *   Ctrl+A          모두 선택
+ *   마우스 드래그   텍스트 선택
  *   Ctrl+F          찾기
  *   F3 / Shift+F3   다음/이전 찾기
  *   Ctrl+G          줄 이동
@@ -30,6 +33,7 @@
  *   Home/End        문서 처음/끝
  *   Ctrl+Home/End   동일
  *   ←/→             가로 스크롤
+ *   Alt+←/→/↑/↓     여백 조절
  *   Ctrl+,/Ctrl+.   폰트 크기 -/+
  *   Ctrl+휠         폰트 크기 -/+
  *   Shift+휠        줄 간격 조절
@@ -45,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "encoding.h"
 
@@ -67,6 +72,7 @@
 #define IDM_OPEN            1001
 #define IDM_EXIT            1002
 #define IDM_GOTO            1003
+#define IDM_SAVE_AS         1004
 #define IDM_FONT_INC        1010
 #define IDM_FONT_DEC        1011
 #define IDM_LINENO          1012
@@ -75,6 +81,9 @@
 #define IDM_FIND_NEXT       1015
 #define IDM_FIND_PREV       1016
 #define IDM_DARK_MODE       1017
+#define IDM_CHOOSE_FONT     1018
+#define IDM_COPY            1030
+#define IDM_SELECT_ALL      1031
 #define IDM_BM_TOGGLE       1040
 #define IDM_BM_NEXT         1041
 #define IDM_BM_PREV         1042
@@ -120,10 +129,15 @@ typedef struct {
     /* 폰트/렌더링 */
     HFONT          font;
     int            font_size;          /* 포인트 */
+    wchar_t        font_face[LF_FACESIZE]; /* 빈 문자열이면 기본(D2Coding) */
+    LONG           font_weight;        /* FW_NORMAL=400, 0이면 NORMAL 처리 */
+    BYTE           font_italic;
     int            char_height;        /* 한 줄 픽셀 높이 */
     int            avg_char_width;     /* 영문 평균 폭 (스크롤 단위) */
     int            line_spacing_extra; /* 줄 간격 추가 픽셀 (Shift+휠) */
     int            char_spacing_extra; /* 자간 추가 픽셀 (Ctrl+Shift+휠) */
+    int            margin_left_px;     /* 좌측 여백 (Alt+←/→) */
+    int            margin_top_px;      /* 상단 여백 (Alt+↑/↓) */
 
     /* 윈도우 */
     HWND           hwnd;
@@ -149,6 +163,11 @@ typedef struct {
     /* 책갈피 (Ctrl+B / F2 / Shift+F2) — 줄 번호 정렬 보관 */
     int            bookmarks[MAX_BOOKMARKS];
     int            bookmark_count;
+
+    /* 텍스트 선택 (마우스 드래그) — text 오프셋, -1=선택 없음 */
+    int            sel_anchor;
+    int            sel_caret;
+    BOOL           sel_dragging;
 
     /* 최근 파일 (HKCU\Software\hview\Recent) */
     wchar_t        recent_paths[RECENT_MAX][MAX_PATH];
@@ -182,6 +201,8 @@ typedef struct {
     COLORREF hl_fg;
     COLORREF dim_fg;      /* 빈 화면 안내 메시지 */
     COLORREF bm_fg;       /* 책갈피 표시 (거터 줄 번호 색) */
+    COLORREF sel_bg;      /* 선택 영역 배경 */
+    COLORREF sel_fg;
 } Theme;
 
 static const Theme THEME_LIGHT = {
@@ -189,7 +210,8 @@ static const Theme THEME_LIGHT = {
     RGB(240, 240, 240), RGB(128, 128, 128),
     RGB(255, 230, 80),  RGB(0, 0, 0),
     RGB(128, 128, 128),
-    RGB(220, 100,   0)
+    RGB(220, 100,   0),
+    RGB(180, 210, 255), RGB(0, 0, 0)
 };
 
 static const Theme THEME_DARK = {
@@ -197,7 +219,8 @@ static const Theme THEME_DARK = {
     RGB( 45,  45,  45), RGB(140, 140, 140),
     RGB(180, 130,   0), RGB(  0,   0,   0),
     RGB(140, 140, 140),
-    RGB(255, 180, 100)
+    RGB(255, 180, 100),
+    RGB( 60,  90, 160), RGB(255, 255, 255)
 };
 
 static const Theme *theme(void) {
@@ -371,16 +394,19 @@ static void create_font(void) {
     int height = -MulDiv(g_state.font_size, dpi_y, 72);
     ReleaseDC(g_state.hwnd, hdc);
 
-    /* 한글 모노스페이스: D2Coding > 나눔고딕코딩 > Consolas+맑은고딕 */
+    LONG weight = g_state.font_weight ? g_state.font_weight : FW_NORMAL;
+    const wchar_t *face = g_state.font_face[0] ? g_state.font_face : L"D2Coding";
+
+    /* 한글 charset 강제 — 폰트 변경 시에도 한글 글리프 보장 */
     g_state.font = CreateFontW(
         height, 0, 0, 0,
-        FW_NORMAL, FALSE, FALSE, FALSE,
-        HANGUL_CHARSET,                 /* 한글 charset 우선 */
+        weight, g_state.font_italic, FALSE, FALSE,
+        HANGUL_CHARSET,
         OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN,
-        L"D2Coding"                     /* 없으면 시스템이 폴백 */
+        face
     );
 
     /* 메트릭 측정 */
@@ -507,9 +533,9 @@ static int gutter_pixel_width(void) {
     return (digits + 2) * unit;
 }
 
-/* 텍스트 영역 가용 폭 (거터 제외) */
+/* 텍스트 영역 가용 폭 (거터 + 좌측 여백 제외) */
 static int text_area_width(void) {
-    int w = g_state.client_w - gutter_pixel_width();
+    int w = g_state.client_w - gutter_pixel_width() - g_state.margin_left_px;
     return w > 0 ? w : 0;
 }
 
@@ -623,6 +649,8 @@ static int load_file(const wchar_t *path, Encoding force_enc) {
     g_state.h_scroll_px = 0;
     g_state.search_match_pos = -1;       /* 새 파일 → 이전 매칭 무효 */
     g_state.bookmark_count = 0;          /* 줄 번호 의미가 달라지므로 초기화 */
+    selection_clear();
+    g_state.sel_dragging = FALSE;
     autoscroll_stop();                   /* 자동 스크롤 중지 */
     wcsncpy_s(g_state.filepath, MAX_PATH, path, _TRUNCATE);
 
@@ -684,24 +712,29 @@ static void on_paint(HWND hwnd) {
     int gutter = gutter_pixel_width();
     int lh     = line_total_height();
     int cextra = g_state.char_spacing_extra;
+    int mtop   = g_state.margin_top_px;
 
-    /* 가시 영역 줄 범위 계산 */
-    int first = ps.rcPaint.top    / lh + g_state.top_line;
-    int last  = ps.rcPaint.bottom / lh + g_state.top_line + 1;
+    /* 가시 영역 줄 범위 — 상단 여백을 빼서 줄 인덱스 변환 */
+    int rel_top    = ps.rcPaint.top    - mtop;
+    int rel_bottom = ps.rcPaint.bottom - mtop;
+    int first = (rel_top    < 0) ? g_state.top_line :
+                (rel_top    / lh + g_state.top_line);
+    int last  = (rel_bottom < 0) ? g_state.top_line :
+                (rel_bottom / lh + g_state.top_line + 1);
     if (first < 0) first = 0;
     if (last > g_state.line_count) last = g_state.line_count;
 
     /* 본문 — 거터 만큼 클리핑하여 가로 스크롤한 텍스트가
      * 거터 영역으로 새지 않게 함. SaveDC/RestoreDC로 클립 영역 복원. */
     int saved = SaveDC(hdc);
-    IntersectClipRect(hdc, gutter, 0,
+    IntersectClipRect(hdc, gutter + g_state.margin_left_px, mtop,
                       g_state.client_w, g_state.client_h);
     SetTextColor(hdc, th->fg);
     SetTextCharacterExtra(hdc, cextra);
-    int x0 = gutter - g_state.h_scroll_px;
+    int x0 = gutter + g_state.margin_left_px - g_state.h_scroll_px;
 
     for (int i = first; i < last; i++) {
-        int y = (i - g_state.top_line) * lh;
+        int y = mtop + (i - g_state.top_line) * lh;
         int start = g_state.line_offsets[i];
         int end   = g_state.line_offsets[i + 1];
         int len = end - start;
@@ -717,6 +750,50 @@ static void on_paint(HWND hwnd) {
             ExtTextOutW(hdc, x0, y, 0, NULL,
                         &g_state.text[start], len, NULL);
         }
+    }
+
+    /* 선택 영역 하이라이트 — 본문 위에 줄별로 덮어 그림.
+     * 다중 줄 선택 가능. 매칭 하이라이트보다 먼저 그려서
+     * 검색 결과가 선택 위에 보이도록 함. */
+    if (has_selection()) {
+        int sel_s = selection_start();
+        int sel_e = selection_end();
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, th->sel_bg);
+        SetTextColor(hdc, th->sel_fg);
+        for (int i = first; i < last; i++) {
+            int ls = g_state.line_offsets[i];
+            int le = g_state.line_offsets[i + 1];
+            int len_text = le - ls;
+            while (len_text > 0) {
+                wchar_t c = g_state.text[ls + len_text - 1];
+                if (c == L'\r' || c == L'\n') len_text--;
+                else break;
+            }
+            if (sel_e <= ls || sel_s >= ls + len_text) continue;
+            int local_s = (sel_s > ls) ? (sel_s - ls) : 0;
+            int local_e = (sel_e < ls + len_text) ?
+                          (sel_e - ls) : len_text;
+            if (local_e <= local_s) continue;
+            SIZE pre_sz, sel_sz;
+            GetTextExtentPoint32W(hdc, &g_state.text[ls],
+                                  local_s, &pre_sz);
+            GetTextExtentPoint32W(hdc, &g_state.text[ls + local_s],
+                                  local_e - local_s, &sel_sz);
+            int pre_w = pre_sz.cx + local_s * cextra;
+            int sel_w = sel_sz.cx + (local_e - local_s) * cextra;
+            int sx = x0 + pre_w;
+            int sy = mtop + (i - g_state.top_line) * lh;
+            RECT rs;
+            rs.left   = sx;
+            rs.top    = sy;
+            rs.right  = sx + sel_w;
+            rs.bottom = sy + lh;
+            ExtTextOutW(hdc, sx, sy, ETO_OPAQUE, &rs,
+                        &g_state.text[ls + local_s],
+                        local_e - local_s, NULL);
+        }
+        SetBkMode(hdc, TRANSPARENT);
     }
 
     /* 검색 매칭 하이라이트 — 같은 클립 영역 안에서 본문 위에 덮어 그림.
@@ -736,7 +813,7 @@ static void on_paint(HWND hwnd) {
                 GetTextExtentPoint32W(hdc, &g_state.text[mp], mlen, &mw);
                 int pre_cx = pre.cx + (mp - ls) * cextra;
                 int mw_cx  = mw.cx  + mlen * cextra;
-                int my = (mline - g_state.top_line) * lh;
+                int my = mtop + (mline - g_state.top_line) * lh;
                 int mx = x0 + pre_cx;
                 RECT rh;
                 rh.left   = mx;
@@ -773,7 +850,7 @@ static void on_paint(HWND hwnd) {
             int len = _snwprintf_s(numbuf, 16, _TRUNCATE, L"%d", i + 1);
             SIZE sz;
             GetTextExtentPoint32W(hdc, numbuf, len, &sz);
-            int y = (i - g_state.top_line) * lh;
+            int y = mtop + (i - g_state.top_line) * lh;
             int x = gutter - sz.cx - unit;
             if (x < 0) x = 0;
             SetTextColor(hdc, bookmark_has(i) ? th->bm_fg : th->gutter_fg);
@@ -798,9 +875,15 @@ static void scroll_to_line(int line) {
     if (delta == 0) return;
 
     g_state.top_line = line;
-    /* ScrollWindowEx로 부드럽게 — 새 영역만 다시 그림 */
+    /* ScrollWindowEx로 부드럽게 — 새 영역만 다시 그림.
+     * 상단 여백은 고정이어야 하므로 mtop 아래만 스크롤. */
+    RECT rc;
+    rc.left   = 0;
+    rc.top    = g_state.margin_top_px;
+    rc.right  = g_state.client_w;
+    rc.bottom = g_state.client_h;
     ScrollWindowEx(g_state.hwnd, 0, -delta * line_total_height(),
-                   NULL, NULL, NULL, NULL,
+                   &rc, &rc, NULL, NULL,
                    SW_INVALIDATE | SW_ERASE);
     update_scrollbars();
 }
@@ -815,10 +898,10 @@ static void scroll_h_to(int px) {
     if (delta == 0) return;
 
     g_state.h_scroll_px = px;
-    /* 거터는 가로 스크롤 시 고정. 텍스트 영역만 ScrollWindowEx. */
+    /* 거터/좌측 여백은 가로 스크롤 시 고정. 텍스트 영역만 ScrollWindowEx. */
     int gutter = gutter_pixel_width();
     RECT rc;
-    rc.left   = gutter;
+    rc.left   = gutter + g_state.margin_left_px;
     rc.top    = 0;
     rc.right  = g_state.client_w;
     rc.bottom = g_state.client_h;
@@ -900,6 +983,144 @@ static void char_spacing_change(int delta) {
     measure_max_line_width();
     update_scrollbars();
     InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+/* 여백 — Alt+방향키. 최대 client 크기의 1/4까지 허용. */
+static void margin_change_left(int delta_px) {
+    int v = g_state.margin_left_px + delta_px;
+    int maxv = g_state.client_w / 4;
+    if (v < 0) v = 0;
+    if (v > maxv) v = maxv;
+    if (v == g_state.margin_left_px) return;
+    g_state.margin_left_px = v;
+    scroll_h_to(g_state.h_scroll_px);   /* 가용폭 변경 → 클램프 */
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+static void margin_change_top(int delta_px) {
+    int v = g_state.margin_top_px + delta_px;
+    int maxv = g_state.client_h / 4;
+    if (v < 0) v = 0;
+    if (v > maxv) v = maxv;
+    if (v == g_state.margin_top_px) return;
+    g_state.margin_top_px = v;
+    int avail_h = g_state.client_h - v;
+    g_state.visible_lines = avail_h > 0 ? avail_h / line_total_height() : 1;
+    if (g_state.visible_lines < 1) g_state.visible_lines = 1;
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+/* ------------------------------------------------------------------
+ * 텍스트 선택 — 마우스 드래그 기반.
+ *
+ * sel_anchor/sel_caret 모두 text 오프셋. anchor==caret이면 선택 없음.
+ * 화면 표시: 두 번째 패스로 선택 영역만 hl 색으로 덮어 그림.
+ * ------------------------------------------------------------------ */
+static int  selection_start(void) {
+    int a = g_state.sel_anchor, c = g_state.sel_caret;
+    return a < c ? a : c;
+}
+static int  selection_end(void) {
+    int a = g_state.sel_anchor, c = g_state.sel_caret;
+    return a > c ? a : c;
+}
+static BOOL has_selection(void) {
+    return g_state.sel_anchor >= 0 && g_state.sel_caret >= 0 &&
+           g_state.sel_anchor != g_state.sel_caret;
+}
+static void selection_clear(void) {
+    g_state.sel_anchor = -1;
+    g_state.sel_caret  = -1;
+}
+
+/* (line, x_target) → text 오프셋 — GetTextExtentExPointW로 누적 폭 산출 후
+ * 가장 가까운 글자 경계 선택. char_spacing_extra는 수동 보정. */
+static int line_offset_at_x(int line, int x_target) {
+    if (line < 0) line = 0;
+    if (line >= g_state.line_count) line = g_state.line_count - 1;
+    int ls = g_state.line_offsets[line];
+    int le = g_state.line_offsets[line + 1];
+    int len = le - ls;
+    while (len > 0) {
+        wchar_t c = g_state.text[ls + len - 1];
+        if (c == L'\r' || c == L'\n') len--;
+        else break;
+    }
+    if (x_target <= 0 || len == 0) return ls;
+
+    HDC hdc = GetDC(g_state.hwnd);
+    HFONT old = (HFONT)SelectObject(hdc, g_state.font);
+    int cextra = g_state.char_spacing_extra;
+
+    INT *widths = (INT*)malloc((size_t)len * sizeof(INT));
+    if (!widths) {
+        SelectObject(hdc, old);
+        ReleaseDC(g_state.hwnd, hdc);
+        return ls + len;
+    }
+    int fit = 0;
+    SIZE sz;
+    GetTextExtentExPointW(hdc, &g_state.text[ls], len, INT_MAX,
+                          &fit, widths, &sz);
+
+    int col = len;  /* 끝까지 다 지나면 줄 끝 */
+    for (int i = 0; i < len; i++) {
+        int x_after  = widths[i] + (i + 1) * cextra;
+        int x_before = (i == 0) ? 0 : (widths[i - 1] + i * cextra);
+        if (x_after > x_target) {
+            int mid = (x_before + x_after) / 2;
+            col = (x_target < mid) ? i : (i + 1);
+            break;
+        }
+    }
+    free(widths);
+    SelectObject(hdc, old);
+    ReleaseDC(g_state.hwnd, hdc);
+    return ls + col;
+}
+
+static int offset_at_mouse(int mx, int my) {
+    if (g_state.line_count == 0) return 0;
+    int rel_y = my - g_state.margin_top_px;
+    if (rel_y < 0) rel_y = 0;
+    int line = rel_y / line_total_height() + g_state.top_line;
+    if (line < 0) line = 0;
+    if (line >= g_state.line_count) line = g_state.line_count - 1;
+
+    int x_target = mx - gutter_pixel_width() - g_state.margin_left_px
+                   + g_state.h_scroll_px;
+    return line_offset_at_x(line, x_target);
+}
+
+static void cmd_select_all(void) {
+    if (g_state.text_len == 0) return;
+    g_state.sel_anchor = 0;
+    g_state.sel_caret  = (int)g_state.text_len;
+    InvalidateRect(g_state.hwnd, NULL, FALSE);
+}
+
+static void cmd_copy(void) {
+    if (!has_selection()) return;
+    int s = selection_start();
+    int e = selection_end();
+    size_t n = (size_t)(e - s);
+    if (!OpenClipboard(g_state.hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(wchar_t));
+    if (h) {
+        wchar_t *p = (wchar_t*)GlobalLock(h);
+        if (p) {
+            memcpy(p, &g_state.text[s], n * sizeof(wchar_t));
+            p[n] = 0;
+            GlobalUnlock(h);
+            SetClipboardData(CF_UNICODETEXT, h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
 }
 
 /* ------------------------------------------------------------------
@@ -1104,6 +1325,56 @@ static void cmd_bookmark_clear(void) {
 }
 
 /* ------------------------------------------------------------------
+ * 폰트 종류 변경 — Win32 표준 ChooseFontW 다이얼로그.
+ *
+ * charset은 항상 HANGUL_CHARSET로 강제하므로 사용자는 face/weight/
+ * italic/size만 선택. 결과는 g_state.font_face/weight/italic/size에
+ * 반영하고 create_font 재호출.
+ * ------------------------------------------------------------------ */
+static void cmd_choose_font(void) {
+    HDC hdc = GetDC(g_state.hwnd);
+    int dpi_y = GetDeviceCaps(hdc, LOGPIXELSY);
+    ReleaseDC(g_state.hwnd, hdc);
+
+    LOGFONTW lf;
+    memset(&lf, 0, sizeof(lf));
+    lf.lfHeight  = -MulDiv(g_state.font_size, dpi_y, 72);
+    lf.lfWeight  = g_state.font_weight ? g_state.font_weight : FW_NORMAL;
+    lf.lfItalic  = g_state.font_italic;
+    lf.lfCharSet = HANGUL_CHARSET;
+    lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    wcscpy_s(lf.lfFaceName, LF_FACESIZE,
+             g_state.font_face[0] ? g_state.font_face : L"D2Coding");
+
+    CHOOSEFONTW cf;
+    memset(&cf, 0, sizeof(cf));
+    cf.lStructSize = sizeof(cf);
+    cf.hwndOwner   = g_state.hwnd;
+    cf.lpLogFont   = &lf;
+    cf.iPointSize  = g_state.font_size * 10;
+    cf.Flags       = CF_INITTOLOGFONTSTRUCT | CF_FORCEFONTEXIST |
+                     CF_NOSCRIPTSEL | CF_TTONLY | CF_SCREENFONTS;
+
+    if (!ChooseFontW(&cf)) return;
+
+    wcscpy_s(g_state.font_face, LF_FACESIZE, lf.lfFaceName);
+    g_state.font_weight = lf.lfWeight;
+    g_state.font_italic = lf.lfItalic;
+    int pt = cf.iPointSize / 10;
+    if (pt < 6)  pt = 6;
+    if (pt > 72) pt = 72;
+    g_state.font_size = pt;
+
+    create_font();
+    int avail = g_state.client_h - g_state.margin_top_px;
+    if (avail < line_total_height()) avail = line_total_height();
+    g_state.visible_lines = avail / line_total_height();
+    measure_max_line_width();
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+/* ------------------------------------------------------------------
  * 다크 모드 토글
  * ------------------------------------------------------------------ */
 static void cmd_toggle_dark_mode(void) {
@@ -1298,6 +1569,122 @@ static void recent_remove(int idx) {
 }
 
 /* ------------------------------------------------------------------
+ * 다른 이름으로 저장 — 인코딩 변환 후 새 파일에 기록.
+ *
+ * UTF-16 본문(g_state.text)을 사용자가 선택한 인코딩으로 변환.
+ * 필터 인덱스로 인코딩 식별 (별도 다이얼로그 회피).
+ * 표현 불가능한 문자가 있으면 사용자에게 확인 후 '?'로 대체.
+ *
+ * Johab은 인코더 미구현 — 메뉴에서 제외.
+ * ------------------------------------------------------------------ */
+static void cmd_save_as(void) {
+    if (g_state.text_len == 0) {
+        show_error(g_state.hwnd, L"저장할 내용이 없습니다.");
+        return;
+    }
+
+    wchar_t path[MAX_PATH] = {0};
+    if (g_state.filepath[0]) wcscpy_s(path, MAX_PATH, g_state.filepath);
+
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_state.hwnd;
+    ofn.lpstrFilter =
+        L"UTF-8 (*.txt)\0*.txt\0"
+        L"UTF-8 BOM (*.txt)\0*.txt\0"
+        L"UTF-16 LE (*.txt)\0*.txt\0"
+        L"UTF-16 BE (*.txt)\0*.txt\0"
+        L"CP949/EUC-KR (*.txt)\0*.txt\0"
+        L"Shift-JIS (*.txt)\0*.txt\0"
+        L"\0";
+    ofn.lpstrFile    = path;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrDefExt  = L"txt";
+    ofn.nFilterIndex = 1;
+    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    Encoding enc;
+    switch (ofn.nFilterIndex) {
+    case 1: enc = ENC_UTF8;     break;
+    case 2: enc = ENC_UTF8_BOM; break;
+    case 3: enc = ENC_UTF16_LE; break;
+    case 4: enc = ENC_UTF16_BE; break;
+    case 5: enc = ENC_CP949;    break;
+    case 6: enc = ENC_SJIS;     break;
+    default: enc = ENC_UTF8;    break;
+    }
+
+    BYTE  *out = NULL;
+    size_t out_len = 0;
+    int    in_len  = (int)g_state.text_len;
+
+    if (enc == ENC_UTF8 || enc == ENC_UTF8_BOM) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, g_state.text, in_len,
+                                    NULL, 0, NULL, NULL);
+        if (n <= 0) { show_error(g_state.hwnd, L"인코딩 변환 실패."); return; }
+        size_t prefix = (enc == ENC_UTF8_BOM) ? 3 : 0;
+        out = (BYTE*)malloc(prefix + (size_t)n);
+        if (!out) { show_error(g_state.hwnd, L"메모리 할당 실패."); return; }
+        if (prefix) { out[0] = 0xEF; out[1] = 0xBB; out[2] = 0xBF; }
+        WideCharToMultiByte(CP_UTF8, 0, g_state.text, in_len,
+                            (char*)(out + prefix), n, NULL, NULL);
+        out_len = prefix + (size_t)n;
+    } else if (enc == ENC_UTF16_LE) {
+        out_len = 2 + (size_t)in_len * 2;
+        out = (BYTE*)malloc(out_len);
+        if (!out) { show_error(g_state.hwnd, L"메모리 할당 실패."); return; }
+        out[0] = 0xFF; out[1] = 0xFE;
+        memcpy(out + 2, g_state.text, (size_t)in_len * 2);
+    } else if (enc == ENC_UTF16_BE) {
+        out_len = 2 + (size_t)in_len * 2;
+        out = (BYTE*)malloc(out_len);
+        if (!out) { show_error(g_state.hwnd, L"메모리 할당 실패."); return; }
+        out[0] = 0xFE; out[1] = 0xFF;
+        for (int i = 0; i < in_len; i++) {
+            wchar_t c = g_state.text[i];
+            out[2 + i * 2]     = (BYTE)((c >> 8) & 0xFF);
+            out[2 + i * 2 + 1] = (BYTE)(c & 0xFF);
+        }
+    } else {
+        UINT cp = (enc == ENC_CP949) ? 949 : 932;
+        BOOL used_default = FALSE;
+        int n = WideCharToMultiByte(cp, 0, g_state.text, in_len,
+                                    NULL, 0, NULL, NULL);
+        if (n <= 0) { show_error(g_state.hwnd, L"인코딩 변환 실패."); return; }
+        out = (BYTE*)malloc((size_t)n);
+        if (!out) { show_error(g_state.hwnd, L"메모리 할당 실패."); return; }
+        WideCharToMultiByte(cp, 0, g_state.text, in_len,
+                            (char*)out, n, "?", &used_default);
+        out_len = (size_t)n;
+        if (used_default) {
+            int r = MessageBoxW(g_state.hwnd,
+                L"일부 문자를 선택한 인코딩으로 변환할 수 없어 '?'로 대체됩니다.\n"
+                L"계속 저장하시겠습니까?",
+                APP_TITLE, MB_YESNO | MB_ICONWARNING);
+            if (r != IDYES) { free(out); return; }
+        }
+    }
+
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(out);
+        show_error(g_state.hwnd, L"파일을 만들 수 없습니다.");
+        return;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, out, (DWORD)out_len, &written, NULL) &&
+              written == (DWORD)out_len;
+    CloseHandle(h);
+    free(out);
+
+    if (!ok) show_error(g_state.hwnd, L"파일 쓰기 실패.");
+}
+
+/* ------------------------------------------------------------------
  * 파일 열기 다이얼로그
  * ------------------------------------------------------------------ */
 static void cmd_open_file(void) {
@@ -1322,6 +1709,8 @@ static HMENU create_menu(void) {
 
     HMENU file_menu = CreatePopupMenu();
     AppendMenuW(file_menu, MF_STRING, IDM_OPEN, L"열기(&O)\tCtrl+O");
+    AppendMenuW(file_menu, MF_STRING, IDM_SAVE_AS,
+                L"다른 이름으로 저장(&S)...");
     AppendMenuW(file_menu, MF_SEPARATOR, 0, NULL);
     g_state.recent_menu = CreatePopupMenu();
     AppendMenuW(file_menu, MF_POPUP, (UINT_PTR)g_state.recent_menu,
@@ -1331,9 +1720,17 @@ static HMENU create_menu(void) {
     AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"종료(&X)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)file_menu, L"파일(&F)");
 
+    HMENU edit_menu = CreatePopupMenu();
+    AppendMenuW(edit_menu, MF_STRING, IDM_COPY,
+                L"복사(&C)\tCtrl+C");
+    AppendMenuW(edit_menu, MF_STRING, IDM_SELECT_ALL,
+                L"모두 선택(&A)\tCtrl+A");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)edit_menu, L"편집(&E)");
+
     HMENU view_menu = CreatePopupMenu();
     AppendMenuW(view_menu, MF_STRING, IDM_FONT_INC, L"글자 크게\tCtrl+.");
     AppendMenuW(view_menu, MF_STRING, IDM_FONT_DEC, L"글자 작게\tCtrl+,");
+    AppendMenuW(view_menu, MF_STRING, IDM_CHOOSE_FONT, L"글꼴 선택...");
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view_menu, MF_STRING, IDM_LINENO,
                 L"줄 번호 표시(&L)\tCtrl+L");
@@ -1388,6 +1785,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_state.hwnd = hwnd;
         g_state.font_size = 11;
         g_state.search_match_pos = -1;
+        g_state.sel_anchor = -1;
+        g_state.sel_caret  = -1;
         create_font();
         DragAcceptFiles(hwnd, TRUE);
         return 0;
@@ -1396,7 +1795,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_state.client_w = LOWORD(lp);
         g_state.client_h = HIWORD(lp);
         if (g_state.char_height > 0) {
-            g_state.visible_lines = g_state.client_h / line_total_height();
+            int avail = g_state.client_h - g_state.margin_top_px;
+            if (avail < line_total_height()) avail = line_total_height();
+            g_state.visible_lines = avail / line_total_height();
         }
         update_scrollbars();
         return 0;
@@ -1454,6 +1855,44 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_LBUTTONDOWN: {
+        SetFocus(hwnd);
+        int mx = (int)(short)LOWORD(lp);
+        int my = (int)(short)HIWORD(lp);
+        int off = offset_at_mouse(mx, my);
+        g_state.sel_anchor = off;
+        g_state.sel_caret  = off;
+        g_state.sel_dragging = TRUE;
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (g_state.sel_dragging && (wp & MK_LBUTTON)) {
+            int mx = (int)(short)LOWORD(lp);
+            int my = (int)(short)HIWORD(lp);
+            int off = offset_at_mouse(mx, my);
+            if (off != g_state.sel_caret) {
+                g_state.sel_caret = off;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_state.sel_dragging) {
+            g_state.sel_dragging = FALSE;
+            ReleaseCapture();
+            /* 클릭만 하고 드래그 안 했으면 선택 없음으로 정리 */
+            if (g_state.sel_anchor == g_state.sel_caret) {
+                selection_clear();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+
     case WM_MOUSEWHEEL: {
         int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
         WORD keys = GET_KEYSTATE_WPARAM(wp);
@@ -1478,6 +1917,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_SYSKEYDOWN: {
+        /* Alt+방향키 — 여백 조절. 그 외 Alt 키는 시스템 처리 위임. */
+        BOOL alt = (lp & (1 << 29)) != 0;
+        if (alt) {
+            int hstep = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
+            int vstep = g_state.char_height > 1 ? g_state.char_height / 2 : 4;
+            switch (wp) {
+            case VK_LEFT:  margin_change_left(-hstep); return 0;
+            case VK_RIGHT: margin_change_left(+hstep); return 0;
+            case VK_UP:    margin_change_top(-vstep);  return 0;
+            case VK_DOWN:  margin_change_top(+vstep);  return 0;
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
     case WM_KEYDOWN: {
         int ctrl = GetKeyState(VK_CONTROL) & 0x8000;
         switch (wp) {
@@ -1495,6 +1950,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       g_state.avg_char_width * 4); break;
         case 'O':
             if (ctrl) cmd_open_file();
+            break;
+        case 'C':
+            if (ctrl) cmd_copy();
+            break;
+        case 'A':
+            if (ctrl) cmd_select_all();
             break;
         case 'G':
             if (ctrl) cmd_goto_line();
@@ -1544,7 +2005,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDM_OPEN:        cmd_open_file(); break;
+        case IDM_SAVE_AS:     cmd_save_as(); break;
         case IDM_EXIT:        DestroyWindow(hwnd); break;
+        case IDM_COPY:        cmd_copy(); break;
+        case IDM_SELECT_ALL:  cmd_select_all(); break;
         case IDM_GOTO:        cmd_goto_line(); break;
         case IDM_LINENO:      cmd_toggle_line_numbers(); break;
         case IDM_DARK_MODE:   cmd_toggle_dark_mode(); break;
@@ -1558,6 +2022,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_BM_CLEAR:    cmd_bookmark_clear(); break;
         case IDM_FONT_INC:     font_change(+1); break;
         case IDM_FONT_DEC:     font_change(-1); break;
+        case IDM_CHOOSE_FONT:  cmd_choose_font(); break;
         case IDM_ENC_AUTO:    reload_with_encoding(ENC_UNKNOWN); break;
         case IDM_ENC_UTF8:    reload_with_encoding(ENC_UTF8); break;
         case IDM_ENC_UTF16LE: reload_with_encoding(ENC_UTF16_LE); break;
