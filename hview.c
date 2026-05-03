@@ -273,13 +273,24 @@ static const Theme THEME_DARK = {
     RGB( 60,  90, 160), RGB(255, 255, 255)
 };
 
+/* 두 색 사이 RGB 채널 블렌드. pct_a = a의 비율(0~100). */
+static COLORREF blend_color(COLORREF a, COLORREF b, int pct_a) {
+    int r  = (GetRValue(a) * pct_a + GetRValue(b) * (100 - pct_a)) / 100;
+    int g  = (GetGValue(a) * pct_a + GetGValue(b) * (100 - pct_a)) / 100;
+    int bl = (GetBValue(a) * pct_a + GetBValue(b) * (100 - pct_a)) / 100;
+    return RGB(r, g, bl);
+}
+
 /* 다크/라이트 프리셋 + 사용자 색(bg/fg) 오버라이드.
+ * dim_fg("파일을 드래그..." 빈 화면 메시지)는 사용자 bg/fg의 중간색으로
+ * 자동 계산 — 어떤 사용자 색 조합에서도 자연스러운 가독성 유지.
  * 다른 색(거터/하이라이트/선택)은 프리셋 그대로. */
 static Theme g_theme_buf;
 static const Theme *theme(void) {
     g_theme_buf = g_state.dark_mode ? THEME_DARK : THEME_LIGHT;
-    g_theme_buf.bg = g_state.user_bg;
-    g_theme_buf.fg = g_state.user_fg;
+    g_theme_buf.bg     = g_state.user_bg;
+    g_theme_buf.fg     = g_state.user_fg;
+    g_theme_buf.dim_fg = blend_color(g_state.user_bg, g_state.user_fg, 50);
     return &g_theme_buf;
 }
 
@@ -2609,7 +2620,7 @@ static HMENU create_menu(void) {
     HMENU menu = CreateMenu();
 
     HMENU file_menu = CreatePopupMenu();
-    AppendMenuW(file_menu, MF_STRING, IDM_OPEN, L"열기(&O)\tCtrl+O");
+    AppendMenuW(file_menu, MF_STRING, IDM_OPEN, L"열기(&O)\t`");
     AppendMenuW(file_menu, MF_STRING, IDM_SAVE_AS,
                 L"다른 이름으로 저장(&S)...");
     AppendMenuW(file_menu, MF_SEPARATOR, 0, NULL);
