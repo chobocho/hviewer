@@ -61,7 +61,7 @@ if %errorlevel% neq 0 (
 )
 
 cl /nologo /O2 /MT /W3 /utf-8 hview.c hview.res ^
-   user32.lib gdi32.lib comdlg32.lib shell32.lib advapi32.lib ^
+   user32.lib gdi32.lib comdlg32.lib shell32.lib advapi32.lib comctl32.lib ^
    /link /SUBSYSTEM:WINDOWS /OUT:hview.exe
 if %errorlevel% neq 0 (
     echo.

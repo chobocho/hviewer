@@ -12,7 +12,7 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra
 LDFLAGS ?= -municode -mwindows -s
-LIBS    := -luser32 -lgdi32 -lcomdlg32 -lshell32 -ladvapi32
+LIBS    := -luser32 -lgdi32 -lcomdlg32 -lshell32 -ladvapi32 -lcomctl32
 
 OUT     := hview.exe
 SRC     := hview.c

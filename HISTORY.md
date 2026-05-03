@@ -75,7 +75,7 @@
 메모리 / 안전성
 - [x] `build_render_lines()` 정수 오버플로 방어 — `dn`/`cap` 산술에 INT_MAX/SIZE_MAX 가드 추가
 - [x] `realloc` 실패 시 기존 포인터 보존 — `build_doc_line_index`/`build_render_lines` 모두 임시 변수 + 성공 시점에 cap 갱신
-- [ ] `find_substr_offset()` 대용량 파일 검색 취소 가능성 — 64MB 파일 선형 검색 시 UI 멈춤 방지 (취소 플래그 또는 진행률 콜백)
+- [x] `find_substr_offset()` 대용량 파일 검색 취소 가능성 — 1M 글자마다 PeekMessage로 Esc 폴링, 취소 시 `검색이 취소되었습니다` 안내
 
 버그
 - [x] `cmd_save_as`: Best-fit 매핑 감지 불가 — `WideCharToMultiByte`에 `WC_NO_BEST_FIT_CHARS` 플래그 추가
@@ -90,14 +90,14 @@
 검색 / UX
 - [x] 대소문자 구분 옵션 — 보기 메뉴 토글 + 레지스트리 영속화 (`FindCase`)
 - [x] 단어 단위 검색 (whole-word) 토글 — 메뉴 토글 + 영속화 (`FindWord`); 한글/CJK/가나/ASCII 단어 경계 판정
-- [ ] 검색어 히스토리 (최근 10개) — 레지스트리에 저장
-- [ ] 키보드 텍스트 선택 (Shift+방향키, Shift+Home/End, Shift+Ctrl+방향키) — 현재 마우스 드래그만 지원
-- [ ] 상태 표시줄 — 현재 줄/열, 파일 크기, 인코딩, 줄 수 등 표시
+- [x] 검색어 히스토리 (최근 10개) — `HKCU\Software\hview\SearchHistory`, "보기 → 최근 검색어" 서브메뉴
+- [x] 키보드 텍스트 선택 (Shift+←/→/↑/↓, Shift+Home/End, Shift+Ctrl+Home/End) — `kb_sel_extend`로 캐럿 이동 + 자동 스크롤
+- [x] 상태 표시줄 — 4파트(줄 X/Y, 위치 N%, 인코딩, 바이트/글자 수); 보기 메뉴로 토글, `StatusBar` 키로 영속화
 
 설정 영속화
 - [x] 책갈피 영속화 — 파일 경로 키로 `HKCU\Software\hview\Bookmarks` 아래 REG_BINARY 저장; 토글/클리어 시 즉시 동기화
 - [x] 윈도우 위치/크기 복원 — `settings_save`에서 `GetWindowPlacement`로 normal RECT + 최대화 상태 보존, `WinMain`에서 가상 화면 좌표 클램프 후 복원
-- [ ] 검색 하이라이트 색상 사용자 지정 — 테마/설정 다이얼로그에서 변경 가능
+- [x] 검색 하이라이트 색상 사용자 지정 — 보기 메뉴 "검색 하이라이트 배경색/글자색", `theme.txt v2`의 `hl_bg`/`hl_fg` 라인 (v1 호환)
 
 문서 / 테스트
 - [x] README 확장 — 기능 요약, 빌드 방법, 단축키 표, 인코딩 지원 행렬 추가

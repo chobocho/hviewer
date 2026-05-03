@@ -19,10 +19,12 @@ Tests:   make test    (Linux/macOS에서는 johab/sjis/hanja만 빌드)
 |------|------|
 | 인코딩 | UTF-8/UTF-16(BOM 자동), CP949, Shift-JIS, 조합형 — 휴리스틱 자동 판별 + 메뉴 수동 지정 |
 | 표시 | 다크 모드, 줄 번호 거터, 자동 줄바꿈, 분할 보기(2 페인 독립 스크롤), 한자→한글 음 표시 |
-| 탐색 | 검색(Ctrl+F, F3, Shift+F3) — 대/소문자 구분 토글, 단어 단위 토글; 줄 이동(Ctrl+G); 책갈피(Ctrl+B / F2 / Shift+F2); 목차(Ctrl+T) |
+| 탐색 | 검색(Ctrl+F, F3, Shift+F3) — 대/소문자 구분 토글, 단어 단위 토글, 검색어 히스토리(최근 10개), Esc로 검색 취소; 줄 이동(Ctrl+G); 책갈피(Ctrl+B / F2 / Shift+F2); 목차(Ctrl+T) |
+| 선택 | 마우스 드래그 + 키보드(Shift+←/→/↑/↓, Shift+Home/End, Shift+Ctrl+Home/End); Ctrl+C 복사, Ctrl+A 모두 선택 |
 | 읽기 편의 | 자동 스크롤(Space), 줄 간격(Shift+휠), 자간(Ctrl+Shift+휠), 여백(Alt+방향키), 폰트 크기(Ctrl+휠 또는 Ctrl+, / Ctrl+.), 폰트 종류(ChooseFont) |
-| 화면 | 전체화면(F11), 두 페인 분할(Alt+1) |
-| 영속화 | 최근 파일, 표시 설정, 윈도우 위치/크기, 책갈피(파일별), 검색 옵션 — 모두 HKCU 레지스트리 |
+| 화면 | 전체화면(F11), 두 페인 분할(Alt+1), 상태 표시줄(줄 X/Y, 위치 %, 인코딩, 크기) |
+| 색상 | 다크 모드, 본문 배경/글자색, 검색 하이라이트 색상 — 모두 ChooseColor + theme.txt v2에 영속화 |
+| 영속화 | 최근 파일, 표시 설정, 윈도우 위치/크기, 책갈피(파일별), 검색 옵션, 검색 히스토리, 상태 표시줄 가시성 — HKCU 레지스트리 + `%APPDATA%\hview\theme.txt` |
 | 입출력 | 명령행 인자, 드래그&드롭, 다른 이름으로 저장(Ctrl+S, 인코딩 변환 + 손실 변환 경고) |
 
 ## 단축키 요약
@@ -39,6 +41,9 @@ Tests:   make test    (Linux/macOS에서는 johab/sjis/hanja만 빌드)
 | `Ctrl+L` | 줄 번호 토글 |
 | `Ctrl+D` | 다크 모드 토글 |
 | `Ctrl+C` / `Ctrl+A` | 복사 / 모두 선택 |
+| `Shift+←/→/↑/↓` | 키보드 선택 확장 |
+| `Shift+Home/End` | 줄 시작/끝까지 선택 |
+| `Shift+Ctrl+Home/End` | 문서 시작/끝까지 선택 |
 | `Alt+1` | 분할 보기 |
 | `Alt+←/→/↑/↓` | 좌/우/상/하 여백 조정 |
 | `F2` / `Shift+F2` | (파일 미열림 시 인코딩 순환 — 보기 메뉴 참조) |
