@@ -26,7 +26,9 @@
  *   Ctrl+D          다크 모드 토글
  *   Ctrl+W          자동 줄바꿈 토글
  *   Ctrl+B          책갈피 추가/제거 (현재 위치)
- *   F2 / Shift+F2   다음/이전 책갈피
+ *   Ctrl+, / Ctrl+. 이전/다음 책갈피
+ *   Ctrl+Shift+, / Ctrl+Shift+. 폰트 크기 -/+
+ *   F2 / Shift+F2   인코딩 순환 (다음/이전)
  *   Ctrl+T          목차 (마크다운 # 헤딩)
  *   F11             전체화면 토글 (Esc로도 빠져나옴)
  *   Space           자동 스크롤 토글 (진행 중 휠로 속도 조절)
@@ -36,7 +38,6 @@
  *   Ctrl+Home/End   동일
  *   ←/→             가로 스크롤
  *   Alt+←/→/↑/↓     여백 조절
- *   Ctrl+,/Ctrl+.   폰트 크기 -/+
  *   Ctrl+휠         폰트 크기 -/+
  *   Shift+휠        줄 간격 조절
  *   Ctrl+Shift+휠   자간 조절
@@ -62,7 +63,7 @@
  * ------------------------------------------------------------------ */
 #define MAX_FILE_SIZE       (64 * 1024 * 1024)   /* 64MB */
 #define INITIAL_LINE_CAP    1024
-#define APP_TITLE           L"hview"
+#define APP_TITLE           L"hViewer V0.1"
 
 /* 자동 스크롤 타이머 */
 #define AUTOSCROLL_TIMER_ID 1
@@ -958,6 +959,24 @@ static void reload_with_encoding(Encoding enc) {
     wchar_t path[MAX_PATH];
     wcscpy_s(path, MAX_PATH, g_state.filepath);
     load_file(path, enc);
+}
+
+/* 인코딩 순환 — F2(다음) / Shift+F2(이전) */
+static void cmd_cycle_encoding(BOOL forward) {
+    if (!g_state.filepath[0]) return;
+    static const Encoding cycle[] = {
+        ENC_UTF8, ENC_UTF16_LE, ENC_UTF16_BE,
+        ENC_CP949, ENC_JOHAB, ENC_SJIS
+    };
+    const int n = (int)(sizeof(cycle) / sizeof(cycle[0]));
+    Encoding cur = g_state.encoding;
+    if (cur == ENC_UTF8_BOM) cur = ENC_UTF8;   /* BOM은 UTF-8 슬롯으로 취급 */
+    int idx = 0;
+    for (int i = 0; i < n; i++) {
+        if (cycle[i] == cur) { idx = i; break; }
+    }
+    idx = forward ? (idx + 1) % n : (idx - 1 + n) % n;
+    reload_with_encoding(cycle[idx]);
 }
 
 /* ------------------------------------------------------------------
@@ -2677,9 +2696,9 @@ static HMENU create_menu(void) {
     AppendMenuW(view_menu, MF_STRING, IDM_BM_TOGGLE,
                 L"책갈피 추가/제거(&B)\tCtrl+B");
     AppendMenuW(view_menu, MF_STRING, IDM_BM_NEXT,
-                L"다음 책갈피\tF2");
+                L"다음 책갈피\tCtrl+.");
     AppendMenuW(view_menu, MF_STRING, IDM_BM_PREV,
-                L"이전 책갈피\tShift+F2");
+                L"이전 책갈피\tCtrl+,");
     AppendMenuW(view_menu, MF_STRING, IDM_BM_CLEAR,
                 L"책갈피 모두 지우기");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)view_menu, L"보기(&V)");
@@ -2687,7 +2706,7 @@ static HMENU create_menu(void) {
     HMENU enc_menu = CreatePopupMenu();
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_AUTO,    L"자동 판별");
     AppendMenuW(enc_menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF8,    L"UTF-8");
+    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF8,    L"UTF-8\tF2 (순환)");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF16LE, L"UTF-16 LE");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF16BE, L"UTF-16 BE");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_CP949,   L"CP949 (EUC-KR)");
@@ -2956,7 +2975,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case VK_F2: {
             int shift = GetKeyState(VK_SHIFT) & 0x8000;
-            cmd_bookmark_jump(shift ? FALSE : TRUE);
+            cmd_cycle_encoding(shift ? FALSE : TRUE);
             break;
         }
         case VK_F3: {
@@ -2974,12 +2993,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_state.autoscroll_active) autoscroll_stop();
             else if (g_state.fs_active) cmd_toggle_fullscreen();
             break;
-        case VK_OEM_PERIOD:  /* '.' 키 */
-            if (ctrl) font_change(+1);
+        case VK_OEM_PERIOD: { /* '.' 키 — Ctrl+. : 다음 책갈피, Ctrl+Shift+. : 폰트 크기 + */
+            int shift = GetKeyState(VK_SHIFT) & 0x8000;
+            if (ctrl && shift)      font_change(+1);
+            else if (ctrl)          cmd_bookmark_jump(TRUE);
             break;
-        case VK_OEM_COMMA:   /* ',' 키 */
-            if (ctrl) font_change(-1);
+        }
+        case VK_OEM_COMMA: {  /* ',' 키 — Ctrl+, : 이전 책갈피, Ctrl+Shift+, : 폰트 크기 - */
+            int shift = GetKeyState(VK_SHIFT) & 0x8000;
+            if (ctrl && shift)      font_change(-1);
+            else if (ctrl)          cmd_bookmark_jump(FALSE);
             break;
+        }
         }
         return 0;
     }
@@ -3021,8 +3046,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_ENC_SJIS:    reload_with_encoding(ENC_SJIS); break;
         case IDM_ABOUT:
             MessageBoxW(hwnd,
-                L"hview — Win32 한글 텍스트 뷰어\n"
-                L"최대 64MB, 조합형 지원",
+                L"hViewer — Win32 무료 한글 텍스트 뷰어\n"
+                L"최대 64MB, 조합형/완성형 지원",
                 APP_TITLE, MB_OK | MB_ICONINFORMATION);
             break;
         default: {

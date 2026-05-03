@@ -133,6 +133,24 @@ static int johab_score(const unsigned char *buf, size_t len) {
     return (int)((hits * 100) / attempts);
 }
 
+/* Johab Hangul로 디코드 가능한 2바이트 페어 절대 개수.
+ *
+ * johab_score는 비율이라, 박스 그리기 등 비-Hangul 바이트가 많은 파일에서는
+ * 점수가 낮게 깔린다 (실제 Johab 본문이 있어도). 이 함수는 절대 카운트라
+ * "Johab Hangul 음절이 적어도 N개 있다"는 신호를 잡을 때 사용. */
+static size_t johab_hangul_count(const unsigned char *buf, size_t len) {
+    size_t hits = 0;
+    size_t i = 0;
+    while (i + 1 < len) {
+        unsigned char b0 = buf[i];
+        if ((b0 & 0x80) == 0) { i++; continue; }
+        uint16_t code = ((uint16_t)b0 << 8) | buf[i + 1];
+        if (johab_decode_syllable(code) != 0) hits++;
+        i += 2;
+    }
+    return hits;
+}
+
 /* ------------------------------------------------------------------
  * 조합형 → UTF-16 변환.
  *

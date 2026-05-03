@@ -223,6 +223,20 @@ static Encoding detect_encoding(const unsigned char *buf, size_t len) {
      * (Windows 한글 환경 표준) */
     if (cp < 50 && jh < 50) return ENC_CP949;
 
+    /* CP949 strict 검증 — Windows CP949 디코더가 거부하는 바이트가 있고
+     * Johab Hangul 음절이 충분히 많으면 Johab으로 판정.
+     * 박스 그리기 등 비-Hangul 영역이 많은 Johab 파일은 johab_score 비율이
+     * 낮게 깔리지만, 그런 파일도 CP949로는 strict invalid가 나오는 경우가
+     * 흔하다 (예: trail 0xFF — CP949 미허용). 이 경우 Hangul pair의 절대
+     * 카운트로 Johab을 식별. */
+    {
+        int cp_strict = MultiByteToWideChar(949, MB_ERR_INVALID_CHARS,
+                                             (const char*)buf, (int)len,
+                                             NULL, 0);
+        if (cp_strict <= 0 && johab_hangul_count(buf, len) >= 10)
+            return ENC_JOHAB;
+    }
+
     /* 동률 또는 비슷한 점수일 때:
      * Johab은 비트 패킹 구조상 trail 0x41~0x7A에 한글 자주 떨어진다.
      * 같은 한글 텍스트를 CP949로 저장하면 보조 영역(lead 0x81~0xA0 또는
