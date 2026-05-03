@@ -343,9 +343,13 @@ typedef struct {
     int            out_buf_len;
     int            done;            /* 0=대기, 1=확인, 2=취소 */
     HWND           edit;
+    int            dpi;             /* 부모 윈도우 DPI (스케일 기준 96) */
+    HFONT          font;            /* 다이얼로그 전용 — WM_DESTROY에서 해제 */
 } PromptCtx;
 
 static PromptCtx *g_prompt;
+
+#define PROMPT_SCALE(v) MulDiv((v), g_prompt->dpi, 96)
 
 static BOOL CALLBACK prompt_set_font(HWND hwnd, LPARAM font) {
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)font, TRUE);
@@ -361,27 +365,49 @@ static LRESULT CALLBACK prompt_wnd_proc(HWND hwnd, UINT msg,
                            WS_BORDER | ES_AUTOHSCROLL;
         if (g_prompt->numeric_only) edit_style |= ES_NUMBER;
 
+        /* DPI 스케일된 UI 폰트 — DEFAULT_GUI_FONT는 96 DPI 고정이라
+         * 고해상도 화면에서 너무 작게 나옴. 9pt Segoe UI를 현재 DPI로. */
+        LOGFONTW lf = { 0 };
+        lf.lfHeight  = -MulDiv(9, g_prompt->dpi, 72);
+        lf.lfWeight  = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
+        g_prompt->font = CreateFontIndirectW(&lf);
+
         CreateWindowW(L"STATIC", g_prompt->prompt,
                       WS_CHILD | WS_VISIBLE,
-                      12, 12, 280, 18, hwnd, NULL, hi, NULL);
+                      PROMPT_SCALE(12), PROMPT_SCALE(12),
+                      PROMPT_SCALE(280), PROMPT_SCALE(18),
+                      hwnd, NULL, hi, NULL);
         g_prompt->edit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", g_prompt->out_buf,
             edit_style,
-            12, 34, 280, 24, hwnd, (HMENU)(UINT_PTR)100, hi, NULL);
+            PROMPT_SCALE(12), PROMPT_SCALE(34),
+            PROMPT_SCALE(280), PROMPT_SCALE(24),
+            hwnd, (HMENU)(UINT_PTR)100, hi, NULL);
         CreateWindowW(L"BUTTON", L"확인",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                      138, 70, 76, 26, hwnd, (HMENU)(UINT_PTR)IDOK,
-                      hi, NULL);
+                      PROMPT_SCALE(138), PROMPT_SCALE(70),
+                      PROMPT_SCALE(76), PROMPT_SCALE(26),
+                      hwnd, (HMENU)(UINT_PTR)IDOK, hi, NULL);
         CreateWindowW(L"BUTTON", L"취소",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                      218, 70, 76, 26, hwnd, (HMENU)(UINT_PTR)IDCANCEL,
-                      hi, NULL);
+                      PROMPT_SCALE(218), PROMPT_SCALE(70),
+                      PROMPT_SCALE(76), PROMPT_SCALE(26),
+                      hwnd, (HMENU)(UINT_PTR)IDCANCEL, hi, NULL);
         EnumChildWindows(hwnd, prompt_set_font,
-                         (LPARAM)GetStockObject(DEFAULT_GUI_FONT));
+                         (LPARAM)(g_prompt->font ? g_prompt->font
+                                                 : (HFONT)GetStockObject(DEFAULT_GUI_FONT)));
         SendMessageW(g_prompt->edit, EM_SETSEL, 0, -1);
         SetFocus(g_prompt->edit);
         return 0;
     }
+    case WM_DESTROY:
+        if (g_prompt && g_prompt->font) {
+            DeleteObject(g_prompt->font);
+            g_prompt->font = NULL;
+        }
+        break;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDOK:
@@ -420,6 +446,15 @@ static int prompt_input(HWND parent, const wchar_t *title,
         registered = 1;
     }
 
+    /* 부모 윈도우의 DPI — HiDPI 디스플레이에서 다이얼로그가 작아지지 않도록 */
+    int dpi;
+    {
+        HDC hdc = GetDC(parent);
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(parent, hdc);
+        if (dpi <= 0) dpi = 96;
+    }
+
     PromptCtx ctx;
     ctx.prompt       = prompt;
     ctx.numeric_only = numeric_only;
@@ -427,12 +462,15 @@ static int prompt_input(HWND parent, const wchar_t *title,
     ctx.out_buf_len  = buflen;
     ctx.done         = 0;
     ctx.edit         = NULL;
+    ctx.dpi          = dpi;
+    ctx.font         = NULL;
     g_prompt = &ctx;
 
-    /* 부모 중앙 배치 */
+    /* 부모 중앙 배치 — 96 DPI 기준 320×140을 현재 DPI로 스케일 */
     RECT pr;
     GetWindowRect(parent, &pr);
-    int w = 320, h = 140;
+    int w = MulDiv(320, dpi, 96);
+    int h = MulDiv(140, dpi, 96);
     int x = pr.left + ((pr.right - pr.left) - w) / 2;
     int y = pr.top  + ((pr.bottom - pr.top) - h) / 2;
 
