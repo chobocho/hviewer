@@ -24,6 +24,7 @@
  *   Ctrl+G          줄 이동
  *   Ctrl+L          줄 번호 표시 토글
  *   Ctrl+D          다크 모드 토글
+ *   Ctrl+W          자동 줄바꿈 토글
  *   Ctrl+B          책갈피 추가/제거 (현재 위치)
  *   F2 / Shift+F2   다음/이전 책갈피
  *   Ctrl+T          목차 (마크다운 # 헤딩)
@@ -84,6 +85,7 @@
 #define IDM_DARK_MODE       1017
 #define IDM_CHOOSE_FONT     1018
 #define IDM_SHOW_TOC        1019
+#define IDM_WRAP            1027
 #define IDM_COPY            1030
 #define IDM_SELECT_ALL      1031
 #define IDM_BM_TOGGLE       1040
@@ -121,9 +123,23 @@ typedef struct {
     wchar_t       *text;
     size_t         text_len;
 
+    /* 렌더 라인 — wrap_mode가 OFF면 doc 라인과 동일.
+     * ON이면 소프트 wrap이 추가되어 더 많은 라인을 가짐. */
     int           *line_offsets;
     int            line_count;
     int            line_cap;
+
+    /* 문서 라인 (실제 줄바꿈) — goto, 책갈피, 줄 번호 가터 표시에 사용 */
+    int           *doc_line_offsets;
+    int            doc_line_count;
+    int            doc_line_cap;
+
+    /* 매핑: render → doc, doc → 첫 render. line_count / doc_line_count 크기. */
+    int           *render_to_doc;
+    int           *doc_to_render;
+
+    /* 자동 줄바꿈 모드 */
+    BOOL           wrap_mode;
 
     /* 뷰포트 */
     int            top_line;
@@ -233,6 +249,7 @@ static const Theme *theme(void) {
 
 /* 전방 선언 — 정의 순서가 어긋나는 경우만 */
 static void recent_add(const wchar_t *path);
+static void rebuild_render_lines_preserve(void);
 
 /* ------------------------------------------------------------------
  * 유틸리티
@@ -425,26 +442,38 @@ static void create_font(void) {
 }
 
 /* ------------------------------------------------------------------
- * 줄 인덱스 구축.
+ * 문자 너비 셀 — wrap 계산 시 시각적 폭을 cell 단위로 근사.
  *
- * 텍스트를 한 번 훑어서 각 줄의 시작 오프셋을 line_offsets 배열에 저장.
- * \r\n, \n, \r 모두 줄 끝으로 처리.
+ * 정확한 GDI 측정은 수십만 줄 처리에 너무 느려서 BMP 영역 휴리스틱:
+ *   ASCII / 라틴 → 1 cell, CJK → 2 cells.
+ * 변폭 폰트일 경우 약간 어긋나지만 wrap이 되긴 됨.
+ * ------------------------------------------------------------------ */
+static int char_width_cells(wchar_t c) {
+    if (c < 0x80) return 1;
+    if (c >= 0x1100 && c <= 0x115F) return 2;     /* Hangul Jamo */
+    if (c >= 0x2E80 && c <= 0x9FFF) return 2;     /* CJK */
+    if (c >= 0xAC00 && c <= 0xD7A3) return 2;     /* Hangul Syllables */
+    if (c >= 0xF900 && c <= 0xFAFF) return 2;     /* CJK Compat */
+    if (c >= 0xFF00 && c <= 0xFF60) return 2;     /* Fullwidth */
+    if (c >= 0xFFE0 && c <= 0xFFE6) return 2;
+    return 1;
+}
+
+/* ------------------------------------------------------------------
+ * 문서 줄 인덱스 — \r, \n, \r\n으로 구분된 실제 줄.
  *
  * 64MB 텍스트(최대 ~3천만 줄)도 ~100ms. 동기 처리로 충분.
- *
- * 알고리즘 노트:
- *   - 줄 종결자를 만나면 line_offsets에 다음 문자 위치 추가
- *   - \r\n은 한 번만 카운트 (\r에서 처리하고 \n 스킵)
- *   - 동적 배열 확장: 2배씩 늘리는 표준 amortized O(1) 패턴
+ * 알고리즘: 줄 종결자에서 다음 줄 시작 위치 등록. \r\n은 한 번만.
+ * 마지막에 sentinel(text_len)로 closure.
  * ------------------------------------------------------------------ */
-static int build_line_index(void) {
-    free(g_state.line_offsets);
-    g_state.line_cap = INITIAL_LINE_CAP;
-    g_state.line_offsets = (int*)malloc(g_state.line_cap * sizeof(int));
-    if (!g_state.line_offsets) return 0;
+static int build_doc_line_index(void) {
+    free(g_state.doc_line_offsets);
+    g_state.doc_line_cap = INITIAL_LINE_CAP;
+    g_state.doc_line_offsets = (int*)malloc(g_state.doc_line_cap * sizeof(int));
+    if (!g_state.doc_line_offsets) return 0;
 
-    g_state.line_count = 0;
-    g_state.line_offsets[g_state.line_count++] = 0;
+    g_state.doc_line_count = 0;
+    g_state.doc_line_offsets[g_state.doc_line_count++] = 0;
 
     const wchar_t *t = g_state.text;
     size_t n = g_state.text_len;
@@ -452,34 +481,160 @@ static int build_line_index(void) {
     for (size_t i = 0; i < n; i++) {
         wchar_t c = t[i];
         if (c == L'\r' || c == L'\n') {
-            /* \r\n은 한 번만 */
             size_t next = i + 1;
             if (c == L'\r' && next < n && t[next] == L'\n') {
-                i = next;  /* \n 스킵, 루프의 i++로 next+1로 이동 */
+                i = next;
             }
-
-            /* 다음 줄 시작 등록 */
-            if (g_state.line_count >= g_state.line_cap) {
-                g_state.line_cap *= 2;
-                int *bigger = (int*)realloc(g_state.line_offsets,
-                                            g_state.line_cap * sizeof(int));
+            if (g_state.doc_line_count >= g_state.doc_line_cap) {
+                g_state.doc_line_cap *= 2;
+                int *bigger = (int*)realloc(g_state.doc_line_offsets,
+                                            g_state.doc_line_cap * sizeof(int));
                 if (!bigger) return 0;
-                g_state.line_offsets = bigger;
+                g_state.doc_line_offsets = bigger;
             }
-            g_state.line_offsets[g_state.line_count++] = (int)(i + 1);
+            g_state.doc_line_offsets[g_state.doc_line_count++] = (int)(i + 1);
         }
     }
 
-    /* sentinel: 마지막 줄 끝 */
-    if (g_state.line_count >= g_state.line_cap) {
-        g_state.line_cap++;
-        int *bigger = (int*)realloc(g_state.line_offsets,
-                                    g_state.line_cap * sizeof(int));
+    if (g_state.doc_line_count >= g_state.doc_line_cap) {
+        g_state.doc_line_cap++;
+        int *bigger = (int*)realloc(g_state.doc_line_offsets,
+                                    g_state.doc_line_cap * sizeof(int));
         if (!bigger) return 0;
-        g_state.line_offsets = bigger;
+        g_state.doc_line_offsets = bigger;
     }
-    g_state.line_offsets[g_state.line_count] = (int)n;
+    g_state.doc_line_offsets[g_state.doc_line_count] = (int)n;
+    return 1;
+}
 
+/* 텍스트 영역 폭 forward 선언 — render 빌더가 사용 */
+static int text_area_width(void);
+
+/* ------------------------------------------------------------------
+ * 렌더 라인 빌드 — wrap_mode에 따라 doc 라인을 그대로 쓰거나 wrap.
+ *
+ * 결과:
+ *   line_offsets[k]    = render 라인 k의 텍스트 시작
+ *   line_count         = render 라인 수
+ *   render_to_doc[k]   = render k가 속한 doc 라인
+ *   doc_to_render[d]   = doc d의 첫 render 라인
+ * ------------------------------------------------------------------ */
+static int build_render_lines(void) {
+    free(g_state.line_offsets);
+    free(g_state.render_to_doc);
+    free(g_state.doc_to_render);
+    g_state.line_offsets   = NULL;
+    g_state.render_to_doc  = NULL;
+    g_state.doc_to_render  = NULL;
+    g_state.line_count     = 0;
+    g_state.line_cap       = 0;
+
+    int dn = g_state.doc_line_count;
+    if (dn <= 0) return 0;
+
+    g_state.doc_to_render = (int*)malloc((size_t)dn * sizeof(int));
+    if (!g_state.doc_to_render) return 0;
+
+    /* avg_char_width 가 0이면 wrap 정확도 떨어짐 — wrap 강제 OFF 처리 */
+    int avail_w = text_area_width();
+    int unit = (g_state.avg_char_width > 0 ? g_state.avg_char_width : 8)
+               + g_state.char_spacing_extra;
+    int max_cells = (g_state.wrap_mode && avail_w > unit) ? avail_w / unit : 0;
+
+    if (max_cells <= 1) {
+        /* wrap OFF or 너비가 너무 작음 → doc 라인을 그대로 복제 */
+        g_state.line_cap = dn + 1;
+        g_state.line_offsets = (int*)malloc((size_t)(dn + 1) * sizeof(int));
+        g_state.render_to_doc = (int*)malloc((size_t)dn * sizeof(int));
+        if (!g_state.line_offsets || !g_state.render_to_doc) return 0;
+        memcpy(g_state.line_offsets, g_state.doc_line_offsets,
+               (size_t)(dn + 1) * sizeof(int));
+        for (int i = 0; i < dn; i++) {
+            g_state.render_to_doc[i] = i;
+            g_state.doc_to_render[i] = i;
+        }
+        g_state.line_count = dn;
+        return 1;
+    }
+
+    /* wrap ON — 각 doc 라인을 cell 폭 기준으로 분할 */
+    int cap = dn + dn / 4 + 16;
+    g_state.line_offsets = (int*)malloc((size_t)(cap + 1) * sizeof(int));
+    g_state.render_to_doc = (int*)malloc((size_t)cap * sizeof(int));
+    if (!g_state.line_offsets || !g_state.render_to_doc) return 0;
+    g_state.line_cap = cap;
+
+    int rcount = 0;
+
+    for (int d = 0; d < dn; d++) {
+        int start = g_state.doc_line_offsets[d];
+        int end   = g_state.doc_line_offsets[d + 1];
+        /* 줄 종결자 제외한 본문 끝 */
+        int text_end = end;
+        while (text_end > start) {
+            wchar_t c = g_state.text[text_end - 1];
+            if (c == L'\r' || c == L'\n') text_end--;
+            else break;
+        }
+
+        g_state.doc_to_render[d] = rcount;
+
+        int seg_start = start;
+        int cells = 0;
+        int last_break = -1;   /* 단어 경계 후보 (공백/탭 위치) */
+        int i = start;
+
+        while (i < text_end) {
+            wchar_t c = g_state.text[i];
+            int w = char_width_cells(c);
+
+            if (cells + w > max_cells && i > seg_start) {
+                int wrap_at = (last_break > seg_start) ?
+                              (last_break + 1) : i;
+                /* render 라인 emit */
+                if (rcount + 2 > g_state.line_cap) {
+                    g_state.line_cap *= 2;
+                    int *a = (int*)realloc(g_state.line_offsets,
+                                           (size_t)(g_state.line_cap + 1) * sizeof(int));
+                    int *b = (int*)realloc(g_state.render_to_doc,
+                                           (size_t)g_state.line_cap * sizeof(int));
+                    if (!a || !b) return 0;
+                    g_state.line_offsets  = a;
+                    g_state.render_to_doc = b;
+                }
+                g_state.line_offsets[rcount]  = seg_start;
+                g_state.render_to_doc[rcount] = d;
+                rcount++;
+
+                seg_start = wrap_at;
+                cells = 0;
+                last_break = -1;
+                i = wrap_at;
+                continue;
+            }
+            cells += w;
+            if (c == L' ' || c == L'\t') last_break = i;
+            i++;
+        }
+
+        /* doc 라인의 마지막 segment (본문이 비어도 한 render 라인 emit) */
+        if (rcount + 2 > g_state.line_cap) {
+            g_state.line_cap *= 2;
+            int *a = (int*)realloc(g_state.line_offsets,
+                                   (size_t)(g_state.line_cap + 1) * sizeof(int));
+            int *b = (int*)realloc(g_state.render_to_doc,
+                                   (size_t)g_state.line_cap * sizeof(int));
+            if (!a || !b) return 0;
+            g_state.line_offsets  = a;
+            g_state.render_to_doc = b;
+        }
+        g_state.line_offsets[rcount]  = seg_start;
+        g_state.render_to_doc[rcount] = d;
+        rcount++;
+    }
+
+    g_state.line_offsets[rcount] = (int)g_state.text_len;
+    g_state.line_count = rcount;
     return 1;
 }
 
@@ -490,21 +645,25 @@ static int build_line_index(void) {
  * 일단 단순 구현: 전체 훑기. 필요하면 최적화.
  * ------------------------------------------------------------------ */
 static void measure_max_line_width(void) {
+    /* wrap 모드면 가로 스크롤이 의미 없음 (모든 줄이 viewport 폭에 맞음) */
+    if (g_state.wrap_mode) {
+        g_state.max_line_px = 0;
+        return;
+    }
+
     HDC hdc = GetDC(g_state.hwnd);
     HFONT old = (HFONT)SelectObject(hdc, g_state.font);
 
     int max_w = 0;
     SIZE sz;
     int cextra = g_state.char_spacing_extra;
-    /* 성능: 전체 줄 측정은 100MB에서 무거우므로
-     * 일단 1만 줄까지만 샘플링. 이후 스크롤 시 갱신.
-     * GetTextExtentPoint32W는 자간을 반영하지 않으므로 len * cextra 보정. */
-    int sample = g_state.line_count < 10000 ? g_state.line_count : 10000;
+    /* doc 줄 전체 측정. 1만 줄 샘플링 (성능 보호). */
+    int sample = g_state.doc_line_count < 10000 ?
+                 g_state.doc_line_count : 10000;
     for (int i = 0; i < sample; i++) {
-        int start = g_state.line_offsets[i];
-        int end   = g_state.line_offsets[i + 1];
+        int start = g_state.doc_line_offsets[i];
+        int end   = g_state.doc_line_offsets[i + 1];
         int len = end - start;
-        /* 줄 종결자 제외 */
         while (len > 0) {
             wchar_t c = g_state.text[start + len - 1];
             if (c == L'\r' || c == L'\n') len--;
@@ -529,8 +688,8 @@ static void measure_max_line_width(void) {
  * 짧은 파일에서도 거터 폭이 들쑥날쑥하지 않게 함.
  * ------------------------------------------------------------------ */
 static int gutter_pixel_width(void) {
-    if (!g_state.show_line_numbers || g_state.line_count == 0) return 0;
-    int digits = 1, n = g_state.line_count;
+    if (!g_state.show_line_numbers || g_state.doc_line_count == 0) return 0;
+    int digits = 1, n = g_state.doc_line_count;
     while (n >= 10) { n /= 10; digits++; }
     if (digits < 4) digits = 4;
     int unit = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
@@ -658,8 +817,12 @@ static int load_file(const wchar_t *path, Encoding force_enc) {
     autoscroll_stop();                   /* 자동 스크롤 중지 */
     wcsncpy_s(g_state.filepath, MAX_PATH, path, _TRUNCATE);
 
-    if (!build_line_index()) {
+    if (!build_doc_line_index()) {
         show_error(g_state.hwnd, L"줄 인덱스 구축 실패.");
+        return 0;
+    }
+    if (!build_render_lines()) {
+        show_error(g_state.hwnd, L"렌더 라인 구축 실패.");
         return 0;
     }
 
@@ -850,14 +1013,19 @@ static void on_paint(HWND hwnd) {
         SetTextCharacterExtra(hdc, 0);
         int unit = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
         for (int i = first; i < last; i++) {
+            int doc = g_state.render_to_doc[i];
+            BOOL first_render =
+                (i == 0) || (g_state.render_to_doc[i - 1] != doc);
+            int y = mtop + (i - g_state.top_line) * lh;
+            if (!first_render) continue;   /* wrap 중간 행은 번호 없음 */
+
             wchar_t numbuf[16];
-            int len = _snwprintf_s(numbuf, 16, _TRUNCATE, L"%d", i + 1);
+            int len = _snwprintf_s(numbuf, 16, _TRUNCATE, L"%d", doc + 1);
             SIZE sz;
             GetTextExtentPoint32W(hdc, numbuf, len, &sz);
-            int y = mtop + (i - g_state.top_line) * lh;
             int x = gutter - sz.cx - unit;
             if (x < 0) x = 0;
-            SetTextColor(hdc, bookmark_has(i) ? th->bm_fg : th->gutter_fg);
+            SetTextColor(hdc, bookmark_has(doc) ? th->bm_fg : th->gutter_fg);
             ExtTextOutW(hdc, x, y, 0, NULL, numbuf, len, NULL);
         }
     }
@@ -961,10 +1129,14 @@ static void font_change(int delta) {
     if (new_size == g_state.font_size) return;
     g_state.font_size = new_size;
     create_font();
-    g_state.visible_lines = g_state.client_h / line_total_height();
-    measure_max_line_width();
-    update_scrollbars();
-    InvalidateRect(g_state.hwnd, NULL, TRUE);
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        g_state.visible_lines = g_state.client_h / line_total_height();
+        measure_max_line_width();
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 static void line_spacing_change(int delta) {
@@ -984,9 +1156,13 @@ static void char_spacing_change(int delta) {
     if (v > 16) v = 16;
     if (v == g_state.char_spacing_extra) return;
     g_state.char_spacing_extra = v;
-    measure_max_line_width();
-    update_scrollbars();
-    InvalidateRect(g_state.hwnd, NULL, TRUE);
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        measure_max_line_width();
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 /* 여백 — Alt+방향키. 최대 client 크기의 1/4까지 허용. */
@@ -997,9 +1173,13 @@ static void margin_change_left(int delta_px) {
     if (v > maxv) v = maxv;
     if (v == g_state.margin_left_px) return;
     g_state.margin_left_px = v;
-    scroll_h_to(g_state.h_scroll_px);   /* 가용폭 변경 → 클램프 */
-    update_scrollbars();
-    InvalidateRect(g_state.hwnd, NULL, TRUE);
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        scroll_h_to(g_state.h_scroll_px);
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 static void margin_change_top(int delta_px) {
@@ -1255,9 +1435,10 @@ static void cmd_show_toc(void) {
     HMENU menu = CreatePopupMenu();
     int count = 0;
 
-    for (int i = 0; i < g_state.line_count && count < 1000; i++) {
-        int ls = g_state.line_offsets[i];
-        int le = g_state.line_offsets[i + 1];
+    /* doc 라인 순회 — wrap 모드에서도 헤딩이 한 번만 잡힘 */
+    for (int i = 0; i < g_state.doc_line_count && count < 1000; i++) {
+        int ls = g_state.doc_line_offsets[i];
+        int le = g_state.doc_line_offsets[i + 1];
         if (ls >= le) continue;
         if (g_state.text[ls] != L'#') continue;
 
@@ -1338,9 +1519,9 @@ static void cmd_show_toc(void) {
         mii.cbSize = sizeof(mii);
         mii.fMask  = MIIM_DATA;
         if (GetMenuItemInfoW(menu, cmd, FALSE, &mii)) {
-            int line = (int)mii.dwItemData;
-            if (line >= 0 && line < g_state.line_count) {
-                scroll_to_line(line);
+            int doc = (int)mii.dwItemData;
+            if (doc >= 0 && doc < g_state.doc_line_count) {
+                scroll_to_line(g_state.doc_to_render[doc]);
             }
         }
     }
@@ -1353,14 +1534,14 @@ static void cmd_show_toc(void) {
  * 1-기반 줄 번호로 입력 받음. 음수/0/초과는 클램프.
  * ------------------------------------------------------------------ */
 static void cmd_goto_line(void) {
-    if (g_state.line_count == 0) return;
+    if (g_state.doc_line_count == 0) return;
     wchar_t buf[16] = {0};
     if (prompt_input(g_state.hwnd, L"줄 이동", L"줄 번호:",
                      TRUE, buf, 16)) {
-        int line = _wtoi(buf);
+        int line = _wtoi(buf);   /* doc 라인 1-기반 */
         if (line < 1) line = 1;
-        if (line > g_state.line_count) line = g_state.line_count;
-        scroll_to_line(line - 1);
+        if (line > g_state.doc_line_count) line = g_state.doc_line_count;
+        scroll_to_line(g_state.doc_to_render[line - 1]);
     }
 }
 
@@ -1383,7 +1564,8 @@ static BOOL bookmark_has(int line) {
 
 static void cmd_bookmark_toggle(void) {
     if (g_state.line_count == 0) return;
-    int line = g_state.top_line;
+    /* 책갈피는 doc 라인 기준 — wrap 토글에도 의미 유지 */
+    int line = g_state.render_to_doc[g_state.top_line];
     int idx = bookmark_index_of(line);
     if (idx >= 0) {
         for (int j = idx; j < g_state.bookmark_count - 1; j++)
@@ -1402,28 +1584,30 @@ static void cmd_bookmark_toggle(void) {
 }
 
 static void cmd_bookmark_jump(BOOL forward) {
-    if (g_state.bookmark_count == 0) return;
-    int curr = g_state.top_line;
-    int target = -1;
+    if (g_state.bookmark_count == 0 || g_state.line_count == 0) return;
+    int curr_doc = g_state.render_to_doc[g_state.top_line];
+    int target_doc = -1;
     if (forward) {
         for (int i = 0; i < g_state.bookmark_count; i++) {
-            if (g_state.bookmarks[i] > curr) {
-                target = g_state.bookmarks[i];
+            if (g_state.bookmarks[i] > curr_doc) {
+                target_doc = g_state.bookmarks[i];
                 break;
             }
         }
-        if (target < 0) target = g_state.bookmarks[0];     /* wrap */
+        if (target_doc < 0) target_doc = g_state.bookmarks[0];
     } else {
         for (int i = g_state.bookmark_count - 1; i >= 0; i--) {
-            if (g_state.bookmarks[i] < curr) {
-                target = g_state.bookmarks[i];
+            if (g_state.bookmarks[i] < curr_doc) {
+                target_doc = g_state.bookmarks[i];
                 break;
             }
         }
-        if (target < 0)
-            target = g_state.bookmarks[g_state.bookmark_count - 1];
+        if (target_doc < 0)
+            target_doc = g_state.bookmarks[g_state.bookmark_count - 1];
     }
-    scroll_to_line(target);
+    if (target_doc >= 0 && target_doc < g_state.doc_line_count) {
+        scroll_to_line(g_state.doc_to_render[target_doc]);
+    }
 }
 
 static void cmd_bookmark_clear(void) {
@@ -1474,12 +1658,16 @@ static void cmd_choose_font(void) {
     g_state.font_size = pt;
 
     create_font();
-    int avail = g_state.client_h - g_state.margin_top_px;
-    if (avail < line_total_height()) avail = line_total_height();
-    g_state.visible_lines = avail / line_total_height();
-    measure_max_line_width();
-    update_scrollbars();
-    InvalidateRect(g_state.hwnd, NULL, TRUE);
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        int avail = g_state.client_h - g_state.margin_top_px;
+        if (avail < line_total_height()) avail = line_total_height();
+        g_state.visible_lines = avail / line_total_height();
+        measure_max_line_width();
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -1498,6 +1686,53 @@ static void cmd_toggle_dark_mode(void) {
 }
 
 /* ------------------------------------------------------------------
+ * 자동 줄바꿈 토글 — top 위치를 doc 기준으로 보존하며 재구축.
+ *
+ * 윈도우 크기 변경, 폰트/자간/여백 변경 시에도 재호출됨
+ * (wrap 모드일 때만 재구축이 필요하므로 wrap_mode 체크는 호출자에서).
+ * ------------------------------------------------------------------ */
+static void rebuild_render_lines_preserve(void) {
+    int top_doc = 0;
+    if (g_state.line_count > 0 && g_state.render_to_doc) {
+        top_doc = g_state.render_to_doc[g_state.top_line];
+    }
+
+    if (!build_render_lines()) return;
+
+    if (g_state.line_count > 0) {
+        if (top_doc < 0) top_doc = 0;
+        if (top_doc >= g_state.doc_line_count)
+            top_doc = g_state.doc_line_count - 1;
+        g_state.top_line = g_state.doc_to_render[top_doc];
+    } else {
+        g_state.top_line = 0;
+    }
+
+    /* visible_lines, scrollbar 갱신 */
+    int avail = g_state.client_h - g_state.margin_top_px;
+    if (avail < line_total_height()) avail = line_total_height();
+    g_state.visible_lines = avail / line_total_height();
+
+    measure_max_line_width();
+    /* h_scroll 클램프 (wrap on 시 max_line_px=0) */
+    if (g_state.h_scroll_px > 0) g_state.h_scroll_px = 0;
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+static void cmd_toggle_wrap(void) {
+    g_state.wrap_mode = !g_state.wrap_mode;
+    HMENU menu = GetMenu(g_state.hwnd);
+    if (!menu) menu = g_state.fs_menu;
+    if (menu) {
+        CheckMenuItem(menu, IDM_WRAP,
+                      MF_BYCOMMAND | (g_state.wrap_mode ?
+                                      MF_CHECKED : MF_UNCHECKED));
+    }
+    rebuild_render_lines_preserve();
+}
+
+/* ------------------------------------------------------------------
  * 줄 번호 거터 토글
  * ------------------------------------------------------------------ */
 static void cmd_toggle_line_numbers(void) {
@@ -1513,9 +1748,13 @@ static void cmd_toggle_line_numbers(void) {
     }
 
     /* 거터 폭이 바뀌면 가로 스크롤 가용폭도 변하므로 클램프 */
-    scroll_h_to(g_state.h_scroll_px);
-    update_scrollbars();
-    InvalidateRect(g_state.hwnd, NULL, TRUE);
+    if (g_state.wrap_mode && g_state.text_len > 0) {
+        rebuild_render_lines_preserve();
+    } else {
+        scroll_h_to(g_state.h_scroll_px);
+        update_scrollbars();
+        InvalidateRect(g_state.hwnd, NULL, TRUE);
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -1688,6 +1927,7 @@ static void settings_load(void) {
 
     g_state.dark_mode          = reg_get_dword(hk, L"DarkMode", 0)    ? TRUE : FALSE;
     g_state.show_line_numbers  = reg_get_dword(hk, L"LineNumbers", 0) ? TRUE : FALSE;
+    g_state.wrap_mode          = reg_get_dword(hk, L"WrapMode", 0)    ? TRUE : FALSE;
     g_state.font_size          = (int)reg_get_dword(hk, L"FontSize", 11);
     g_state.font_weight        = (LONG)reg_get_dword(hk, L"FontWeight", 0);
     g_state.font_italic        = reg_get_dword(hk, L"FontItalic", 0)  ? 1 : 0;
@@ -1726,6 +1966,7 @@ static void settings_save(void) {
 
     reg_set_dword(hk, L"DarkMode",     g_state.dark_mode ? 1 : 0);
     reg_set_dword(hk, L"LineNumbers",  g_state.show_line_numbers ? 1 : 0);
+    reg_set_dword(hk, L"WrapMode",     g_state.wrap_mode ? 1 : 0);
     reg_set_dword(hk, L"FontSize",     (DWORD)g_state.font_size);
     reg_set_dword(hk, L"FontWeight",   (DWORD)g_state.font_weight);
     reg_set_dword(hk, L"FontItalic",   g_state.font_italic ? 1 : 0);
@@ -1925,6 +2166,8 @@ static HMENU create_menu(void) {
                 L"줄 번호 표시(&L)\tCtrl+L");
     AppendMenuW(view_menu, MF_STRING, IDM_DARK_MODE,
                 L"다크 모드(&D)\tCtrl+D");
+    AppendMenuW(view_menu, MF_STRING, IDM_WRAP,
+                L"자동 줄바꿈(&W)\tCtrl+W");
     AppendMenuW(view_menu, MF_STRING, IDM_FULLSCREEN,
                 L"전체화면(&F)\tF11");
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
@@ -1991,6 +2234,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CheckMenuItem(m, IDM_LINENO,
                           MF_BYCOMMAND | (g_state.show_line_numbers ?
                                           MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_WRAP,
+                          MF_BYCOMMAND | (g_state.wrap_mode ?
+                                          MF_CHECKED : MF_UNCHECKED));
         }
         return 0;
     }
@@ -2003,7 +2249,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (avail < line_total_height()) avail = line_total_height();
             g_state.visible_lines = avail / line_total_height();
         }
-        update_scrollbars();
+        if (g_state.wrap_mode && g_state.text_len > 0) {
+            rebuild_render_lines_preserve();
+        } else {
+            update_scrollbars();
+        }
         return 0;
     }
 
@@ -2173,6 +2423,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'D':
             if (ctrl) cmd_toggle_dark_mode();
             break;
+        case 'W':
+            if (ctrl) cmd_toggle_wrap();
+            break;
         case 'B':
             if (ctrl) cmd_bookmark_toggle();
             break;
@@ -2219,6 +2472,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_GOTO:        cmd_goto_line(); break;
         case IDM_LINENO:      cmd_toggle_line_numbers(); break;
         case IDM_DARK_MODE:   cmd_toggle_dark_mode(); break;
+        case IDM_WRAP:        cmd_toggle_wrap(); break;
         case IDM_FULLSCREEN:  cmd_toggle_fullscreen(); break;
         case IDM_FIND:        cmd_find(); break;
         case IDM_FIND_NEXT:   cmd_find_again(TRUE); break;
@@ -2279,6 +2533,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         free(g_state.raw_data);
         free(g_state.text);
         free(g_state.line_offsets);
+        free(g_state.doc_line_offsets);
+        free(g_state.render_to_doc);
+        free(g_state.doc_to_render);
         PostQuitMessage(0);
         return 0;
     }
