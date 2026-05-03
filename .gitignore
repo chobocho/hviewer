@@ -1,0 +1,12 @@
+# 빌드 산출물
+hview.exe
+hview.obj
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# 테스트 빌드물
+tests/hview_tests
+tests/hview_tests.exe
+tests/test_main.obj
