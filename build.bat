@@ -53,7 +53,14 @@ REM VsDevCmd may change the working directory - return to script folder.
 cd /d "%~dp0"
 
 :compile
-cl /nologo /O2 /MT /W3 /utf-8 hview.c ^
+rc /nologo /fo hview.res hview.rc
+if %errorlevel% neq 0 (
+    echo.
+    echo [ERROR] Resource compile failed.
+    exit /b 1
+)
+
+cl /nologo /O2 /MT /W3 /utf-8 hview.c hview.res ^
    user32.lib gdi32.lib comdlg32.lib shell32.lib advapi32.lib ^
    /link /SUBSYSTEM:WINDOWS /OUT:hview.exe
 if %errorlevel% neq 0 (
@@ -63,6 +70,7 @@ if %errorlevel% neq 0 (
 )
 
 if exist hview.obj del hview.obj
+if exist hview.res del hview.res
 echo.
 echo Build OK: hview.exe
 endlocal

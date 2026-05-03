@@ -1,0 +1,8 @@
+/* hview.rc — Windows resource script
+ *
+ * IDI_APPICON: 윈도우 클래스 hIcon, 큰/작은 아이콘 양쪽에 사용.
+ * ID 1번이라 Explorer가 .exe 파일 아이콘으로도 채택. */
+
+#include "hview_resources.h"
+
+IDI_APPICON ICON "icon.ico"

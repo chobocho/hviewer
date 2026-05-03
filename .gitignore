@@ -1,6 +1,7 @@
 # 빌드 산출물
 hview.exe
 hview.obj
+hview.res
 *.obj
 *.o
 *.pdb

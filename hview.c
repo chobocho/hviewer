@@ -58,6 +58,7 @@
 
 #include "encoding.h"
 #include "hanja.h"
+#include "hview_resources.h"
 
 /* ------------------------------------------------------------------
  * 상수
@@ -3214,10 +3215,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
     /* 최근 파일 — 메뉴 생성 전에 로드되어야 초기 메뉴에 반영됨 */
     recent_load();
 
+    /* 큰/작은 아이콘 양쪽 로드 — 작업 표시줄과 타이틀 바에 모두 사용 */
+    HICON h_big   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON),
+                                       GetSystemMetrics(SM_CYICON),
+                                       LR_DEFAULTCOLOR);
+    HICON h_small = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON),
+                                       GetSystemMetrics(SM_CYSMICON),
+                                       LR_DEFAULTCOLOR);
+
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = hInst;
+    wc.hIcon         = h_big;
+    wc.hIconSm       = h_small;
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"hview_main";
