@@ -25,6 +25,7 @@
  * 단일 TU에서 직접 인클루드하면 충분하다.
  * ------------------------------------------------------------------ */
 #include "../johab.h"
+#include "../sjis.h"
 
 #ifdef _WIN32
 # include "../encoding.h"
@@ -200,6 +201,42 @@ TEST(johab_to_utf16_empty) {
 }
 
 /* ==================================================================
+ * Phase 5 — sjis.h (휴리스틱 스코어, 순수 C — 어디서나 빌드)
+ * ================================================================== */
+
+TEST(sjis_score_pure_ascii_zero) {
+    const unsigned char buf[] = "Hello, world.\n";
+    ASSERT_EQ(sjis_score(buf, sizeof(buf) - 1), 0);
+}
+
+TEST(sjis_score_too_short) {
+    const unsigned char buf[] = { 0xA1, 0xA2, 0xA3 };
+    ASSERT_EQ(sjis_score(buf, sizeof(buf)), 0);
+}
+
+TEST(sjis_score_half_width_kana_all_hits) {
+    /* 0xA1-0xDF 영역만으로 4 바이트 — 전부 가나 */
+    const unsigned char buf[] = { 0xA1, 0xB0, 0xC5, 0xDF };
+    ASSERT_EQ(sjis_score(buf, sizeof(buf)), 100);
+}
+
+TEST(sjis_score_two_byte_kanji_all_hits) {
+    /* "あいうえお" — 5 hiragana × 2 = 10 bytes
+     *   あ = 0x82 0xA0,  い = 0x82 0xA2,  う = 0x82 0xA4
+     *   え = 0x82 0xA6,  お = 0x82 0xA8 */
+    const unsigned char buf[] = {
+        0x82, 0xA0, 0x82, 0xA2, 0x82, 0xA4, 0x82, 0xA6, 0x82, 0xA8,
+    };
+    ASSERT_EQ(sjis_score(buf, sizeof(buf)), 100);
+}
+
+TEST(sjis_score_invalid_lead_zero) {
+    /* 0x80, 0xA0, 0xFD-0xFF — SJIS lead/kana 어디에도 안 맞음 */
+    const unsigned char buf[] = { 0x80, 0xA0, 0xFE, 0xFF };
+    ASSERT_EQ(sjis_score(buf, sizeof(buf)), 0);
+}
+
+/* ==================================================================
  * Phase 0 — encoding.h (Win32 의존)
  *
  * BOM 검출, UTF-8 유효성, CP949 점수 등은 Win32 API를 호출하지 않으므로
@@ -334,6 +371,17 @@ TEST(convert_johab_dispatches_correctly) {
     free(out);
 }
 
+TEST(convert_sjis_hiragana_a) {
+    /* "あ" SJIS 0x82 0xA0 → U+3042 (UTF-16 1 단위) */
+    const unsigned char buf[] = { 0x82, 0xA0 };
+    size_t wlen = 0;
+    wchar_t *out = convert_to_utf16(buf, sizeof(buf), ENC_SJIS, &wlen);
+    ASSERT_TRUE(out != NULL);
+    ASSERT_EQ(wlen, 1u);
+    ASSERT_EQ(out[0], 0x3042);
+    free(out);
+}
+
 TEST(convert_empty_input) {
     size_t wlen = 0xDEAD;
     wchar_t *out = convert_to_utf16((const unsigned char*)"", 0,
@@ -399,6 +447,13 @@ int main(void) {
     RUN(johab_to_utf16_mixed);
     RUN(johab_to_utf16_empty);
 
+    printf("\n[sjis.h]\n");
+    RUN(sjis_score_pure_ascii_zero);
+    RUN(sjis_score_too_short);
+    RUN(sjis_score_half_width_kana_all_hits);
+    RUN(sjis_score_two_byte_kanji_all_hits);
+    RUN(sjis_score_invalid_lead_zero);
+
 #ifdef _WIN32
     printf("\n[encoding.h]\n");
     RUN(detect_utf8_bom);
@@ -417,6 +472,7 @@ int main(void) {
     RUN(convert_utf16_le_strips_bom);
     RUN(convert_utf16_be_byteswap);
     RUN(convert_johab_dispatches_correctly);
+    RUN(convert_sjis_hiragana_a);
     RUN(convert_empty_input);
 #else
     printf("\n[encoding.h] skipped — requires Win32 (build on MinGW or MSVC)\n");

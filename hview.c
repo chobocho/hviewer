@@ -20,13 +20,20 @@
  *   F3 / Shift+F3   다음/이전 찾기
  *   Ctrl+G          줄 이동
  *   Ctrl+L          줄 번호 표시 토글
+ *   Ctrl+D          다크 모드 토글
+ *   Ctrl+B          책갈피 추가/제거 (현재 위치)
+ *   F2 / Shift+F2   다음/이전 책갈피
  *   F11             전체화면 토글 (Esc로도 빠져나옴)
+ *   Space           자동 스크롤 토글 (진행 중 휠로 속도 조절)
  *   ↑/↓             한 줄 스크롤
  *   PageUp/PageDown 한 화면 스크롤
  *   Home/End        문서 처음/끝
  *   Ctrl+Home/End   동일
  *   ←/→             가로 스크롤
  *   Ctrl+,/Ctrl+.   폰트 크기 -/+
+ *   Ctrl+휠         폰트 크기 -/+
+ *   Shift+휠        줄 간격 조절
+ *   Ctrl+Shift+휠   자간 조절
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -48,6 +55,14 @@
 #define INITIAL_LINE_CAP    1024
 #define APP_TITLE           L"hview"
 
+/* 자동 스크롤 타이머 */
+#define AUTOSCROLL_TIMER_ID 1
+#define AUTOSCROLL_DEFAULT_MS 250
+#define AUTOSCROLL_MIN_MS     30
+#define AUTOSCROLL_MAX_MS     2000
+
+#define MAX_BOOKMARKS       32
+
 /* 메뉴 ID */
 #define IDM_OPEN            1001
 #define IDM_EXIT            1002
@@ -59,6 +74,11 @@
 #define IDM_FIND            1014
 #define IDM_FIND_NEXT       1015
 #define IDM_FIND_PREV       1016
+#define IDM_DARK_MODE       1017
+#define IDM_BM_TOGGLE       1040
+#define IDM_BM_NEXT         1041
+#define IDM_BM_PREV         1042
+#define IDM_BM_CLEAR        1043
 #define IDM_ENC_AUTO        1020
 #define IDM_RECENT_BASE     1100        /* 1100..1109 */
 #define RECENT_MAX          10
@@ -68,6 +88,7 @@
 #define IDM_ENC_UTF16BE     1023
 #define IDM_ENC_CP949       1024
 #define IDM_ENC_JOHAB       1025
+#define IDM_ENC_SJIS        1026
 #define IDM_ABOUT           1090
 
 /* ------------------------------------------------------------------
@@ -98,9 +119,11 @@ typedef struct {
 
     /* 폰트/렌더링 */
     HFONT          font;
-    int            font_size;       /* 포인트 */
-    int            char_height;     /* 한 줄 픽셀 높이 */
-    int            avg_char_width;  /* 영문 평균 폭 (스크롤 단위) */
+    int            font_size;          /* 포인트 */
+    int            char_height;        /* 한 줄 픽셀 높이 */
+    int            avg_char_width;     /* 영문 평균 폭 (스크롤 단위) */
+    int            line_spacing_extra; /* 줄 간격 추가 픽셀 (Shift+휠) */
+    int            char_spacing_extra; /* 자간 추가 픽셀 (Ctrl+Shift+휠) */
 
     /* 윈도우 */
     HWND           hwnd;
@@ -115,6 +138,17 @@ typedef struct {
     wchar_t        search_needle[256];
     int            search_needle_len;
     int            search_match_pos;    /* text 내 매칭 시작 오프셋, -1=없음 */
+
+    /* 자동 스크롤 (Space) */
+    BOOL           autoscroll_active;
+    int            autoscroll_delay_ms;
+
+    /* 다크 모드 */
+    BOOL           dark_mode;
+
+    /* 책갈피 (Ctrl+B / F2 / Shift+F2) — 줄 번호 정렬 보관 */
+    int            bookmarks[MAX_BOOKMARKS];
+    int            bookmark_count;
 
     /* 최근 파일 (HKCU\Software\hview\Recent) */
     wchar_t        recent_paths[RECENT_MAX][MAX_PATH];
@@ -133,6 +167,42 @@ typedef struct {
 } ViewerState;
 
 static ViewerState g_state;
+
+/* ------------------------------------------------------------------
+ * 색 테마 — 다크 모드 토글로 전환.
+ * 시스템 색(GetSysColor)에 의존하지 않고 고정 팔레트 사용 — 윈도우
+ * 테마와 무관하게 일관된 모양을 보장 (특히 한글 글꼴 가독성).
+ * ------------------------------------------------------------------ */
+typedef struct {
+    COLORREF bg;          /* 본문 배경 */
+    COLORREF fg;          /* 본문 글자 */
+    COLORREF gutter_bg;
+    COLORREF gutter_fg;
+    COLORREF hl_bg;       /* 검색 매칭 배경 */
+    COLORREF hl_fg;
+    COLORREF dim_fg;      /* 빈 화면 안내 메시지 */
+    COLORREF bm_fg;       /* 책갈피 표시 (거터 줄 번호 색) */
+} Theme;
+
+static const Theme THEME_LIGHT = {
+    RGB(255, 255, 255), RGB(0, 0, 0),
+    RGB(240, 240, 240), RGB(128, 128, 128),
+    RGB(255, 230, 80),  RGB(0, 0, 0),
+    RGB(128, 128, 128),
+    RGB(220, 100,   0)
+};
+
+static const Theme THEME_DARK = {
+    RGB( 30,  30,  30), RGB(220, 220, 220),
+    RGB( 45,  45,  45), RGB(140, 140, 140),
+    RGB(180, 130,   0), RGB(  0,   0,   0),
+    RGB(140, 140, 140),
+    RGB(255, 180, 100)
+};
+
+static const Theme *theme(void) {
+    return g_state.dark_mode ? &THEME_DARK : &THEME_LIGHT;
+}
 
 /* 전방 선언 — 정의 순서가 어긋나는 경우만 */
 static void recent_add(const wchar_t *path);
@@ -395,8 +465,10 @@ static void measure_max_line_width(void) {
 
     int max_w = 0;
     SIZE sz;
+    int cextra = g_state.char_spacing_extra;
     /* 성능: 전체 줄 측정은 100MB에서 무거우므로
-     * 일단 1만 줄까지만 샘플링. 이후 스크롤 시 갱신. */
+     * 일단 1만 줄까지만 샘플링. 이후 스크롤 시 갱신.
+     * GetTextExtentPoint32W는 자간을 반영하지 않으므로 len * cextra 보정. */
     int sample = g_state.line_count < 10000 ? g_state.line_count : 10000;
     for (int i = 0; i < sample; i++) {
         int start = g_state.line_offsets[i];
@@ -410,7 +482,8 @@ static void measure_max_line_width(void) {
         }
         if (len > 0) {
             GetTextExtentPoint32W(hdc, &g_state.text[start], len, &sz);
-            if (sz.cx > max_w) max_w = sz.cx;
+            int total = sz.cx + len * cextra;
+            if (total > max_w) max_w = total;
         }
     }
 
@@ -438,6 +511,12 @@ static int gutter_pixel_width(void) {
 static int text_area_width(void) {
     int w = g_state.client_w - gutter_pixel_width();
     return w > 0 ? w : 0;
+}
+
+/* 줄 사이 간격 포함 한 줄 총 높이 */
+static int line_total_height(void) {
+    int h = g_state.char_height + g_state.line_spacing_extra;
+    return h > 0 ? h : 1;
 }
 
 /* ------------------------------------------------------------------
@@ -543,6 +622,8 @@ static int load_file(const wchar_t *path, Encoding force_enc) {
     g_state.top_line = 0;
     g_state.h_scroll_px = 0;
     g_state.search_match_pos = -1;       /* 새 파일 → 이전 매칭 무효 */
+    g_state.bookmark_count = 0;          /* 줄 번호 의미가 달라지므로 초기화 */
+    autoscroll_stop();                   /* 자동 스크롤 중지 */
     wcsncpy_s(g_state.filepath, MAX_PATH, path, _TRUNCATE);
 
     if (!build_line_index()) {
@@ -579,14 +660,17 @@ static void reload_with_encoding(Encoding enc) {
 static void on_paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
+    const Theme *th = theme();
 
-    /* 배경 — 시스템 윈도우 색 */
-    FillRect(hdc, &ps.rcPaint, (HBRUSH)(COLOR_WINDOW + 1));
+    /* 배경 — 테마 색 (시스템 색 무시) */
+    HBRUSH bg_brush = CreateSolidBrush(th->bg);
+    FillRect(hdc, &ps.rcPaint, bg_brush);
+    DeleteObject(bg_brush);
 
     if (!g_state.text || g_state.line_count == 0) {
         const wchar_t *msg = L"파일을 드래그하거나 Ctrl+O로 여세요.";
         HFONT old = (HFONT)SelectObject(hdc, g_state.font);
-        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+        SetTextColor(hdc, th->dim_fg);
         SetBkMode(hdc, TRANSPARENT);
         TextOutW(hdc, 20, 20, msg, (int)wcslen(msg));
         SelectObject(hdc, old);
@@ -598,10 +682,12 @@ static void on_paint(HWND hwnd) {
     SetBkMode(hdc, TRANSPARENT);
 
     int gutter = gutter_pixel_width();
+    int lh     = line_total_height();
+    int cextra = g_state.char_spacing_extra;
 
     /* 가시 영역 줄 범위 계산 */
-    int first = ps.rcPaint.top    / g_state.char_height + g_state.top_line;
-    int last  = ps.rcPaint.bottom / g_state.char_height + g_state.top_line + 1;
+    int first = ps.rcPaint.top    / lh + g_state.top_line;
+    int last  = ps.rcPaint.bottom / lh + g_state.top_line + 1;
     if (first < 0) first = 0;
     if (last > g_state.line_count) last = g_state.line_count;
 
@@ -610,11 +696,12 @@ static void on_paint(HWND hwnd) {
     int saved = SaveDC(hdc);
     IntersectClipRect(hdc, gutter, 0,
                       g_state.client_w, g_state.client_h);
-    SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+    SetTextColor(hdc, th->fg);
+    SetTextCharacterExtra(hdc, cextra);
     int x0 = gutter - g_state.h_scroll_px;
 
     for (int i = first; i < last; i++) {
-        int y = (i - g_state.top_line) * g_state.char_height;
+        int y = (i - g_state.top_line) * lh;
         int start = g_state.line_offsets[i];
         int end   = g_state.line_offsets[i + 1];
         int len = end - start;
@@ -633,7 +720,9 @@ static void on_paint(HWND hwnd) {
     }
 
     /* 검색 매칭 하이라이트 — 같은 클립 영역 안에서 본문 위에 덮어 그림.
-     * 매칭이 줄바꿈을 가로지르면 그리지 않음(드문 경우). */
+     * 매칭이 줄바꿈을 가로지르면 그리지 않음(드문 경우).
+     * GetTextExtentPoint32W는 SetTextCharacterExtra를 반영하지 않으므로
+     * len * cextra를 수동으로 더해 정확한 픽셀 위치를 구함. */
     if (g_state.search_match_pos >= 0 && g_state.search_needle_len > 0) {
         int mp = g_state.search_match_pos;
         int mline = line_for_offset(mp);
@@ -645,16 +734,18 @@ static void on_paint(HWND hwnd) {
                 SIZE pre, mw;
                 GetTextExtentPoint32W(hdc, &g_state.text[ls], mp - ls, &pre);
                 GetTextExtentPoint32W(hdc, &g_state.text[mp], mlen, &mw);
-                int my = (mline - g_state.top_line) * g_state.char_height;
-                int mx = x0 + pre.cx;
+                int pre_cx = pre.cx + (mp - ls) * cextra;
+                int mw_cx  = mw.cx  + mlen * cextra;
+                int my = (mline - g_state.top_line) * lh;
+                int mx = x0 + pre_cx;
                 RECT rh;
                 rh.left   = mx;
                 rh.top    = my;
-                rh.right  = mx + mw.cx;
-                rh.bottom = my + g_state.char_height;
+                rh.right  = mx + mw_cx;
+                rh.bottom = my + lh;
                 SetBkMode(hdc, OPAQUE);
-                SetBkColor(hdc, RGB(255, 230, 80));
-                SetTextColor(hdc, RGB(0, 0, 0));
+                SetBkColor(hdc, th->hl_bg);
+                SetTextColor(hdc, th->hl_fg);
                 ExtTextOutW(hdc, mx, my, ETO_OPAQUE, &rh,
                             &g_state.text[mp], mlen, NULL);
                 SetBkMode(hdc, TRANSPARENT);
@@ -664,25 +755,28 @@ static void on_paint(HWND hwnd) {
 
     RestoreDC(hdc, saved);
 
-    /* 거터 — 본문 위에 덮어 그림 (스크롤된 텍스트가 가려지도록). */
+    /* 거터 — 본문 위에 덮어 그림. 줄 번호는 자간 영향 받지 않음. */
     if (gutter > 0) {
         RECT gr;
         gr.left   = 0;
         gr.top    = ps.rcPaint.top;
         gr.right  = gutter;
         gr.bottom = ps.rcPaint.bottom;
-        FillRect(hdc, &gr, (HBRUSH)(COLOR_BTNFACE + 1));
+        HBRUSH gb = CreateSolidBrush(th->gutter_bg);
+        FillRect(hdc, &gr, gb);
+        DeleteObject(gb);
 
-        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+        SetTextCharacterExtra(hdc, 0);
         int unit = g_state.avg_char_width > 0 ? g_state.avg_char_width : 8;
         for (int i = first; i < last; i++) {
             wchar_t numbuf[16];
             int len = _snwprintf_s(numbuf, 16, _TRUNCATE, L"%d", i + 1);
             SIZE sz;
             GetTextExtentPoint32W(hdc, numbuf, len, &sz);
-            int y = (i - g_state.top_line) * g_state.char_height;
+            int y = (i - g_state.top_line) * lh;
             int x = gutter - sz.cx - unit;
             if (x < 0) x = 0;
+            SetTextColor(hdc, bookmark_has(i) ? th->bm_fg : th->gutter_fg);
             ExtTextOutW(hdc, x, y, 0, NULL, numbuf, len, NULL);
         }
     }
@@ -705,7 +799,7 @@ static void scroll_to_line(int line) {
 
     g_state.top_line = line;
     /* ScrollWindowEx로 부드럽게 — 새 영역만 다시 그림 */
-    ScrollWindowEx(g_state.hwnd, 0, -delta * g_state.char_height,
+    ScrollWindowEx(g_state.hwnd, 0, -delta * line_total_height(),
                    NULL, NULL, NULL, NULL,
                    SW_INVALIDATE | SW_ERASE);
     update_scrollbars();
@@ -732,6 +826,80 @@ static void scroll_h_to(int px) {
                    &rc, &rc, NULL, NULL,
                    SW_INVALIDATE | SW_ERASE);
     update_scrollbars();
+}
+
+/* ------------------------------------------------------------------
+ * 자동 스크롤 — Space로 토글, 진행 중 휠로 속도 조절.
+ * ------------------------------------------------------------------ */
+static void autoscroll_start(void) {
+    if (g_state.autoscroll_active) return;
+    if (g_state.autoscroll_delay_ms <= 0)
+        g_state.autoscroll_delay_ms = AUTOSCROLL_DEFAULT_MS;
+    SetTimer(g_state.hwnd, AUTOSCROLL_TIMER_ID,
+             (UINT)g_state.autoscroll_delay_ms, NULL);
+    g_state.autoscroll_active = TRUE;
+}
+
+static void autoscroll_stop(void) {
+    if (!g_state.autoscroll_active) return;
+    KillTimer(g_state.hwnd, AUTOSCROLL_TIMER_ID);
+    g_state.autoscroll_active = FALSE;
+}
+
+static void autoscroll_toggle(void) {
+    if (g_state.autoscroll_active) autoscroll_stop();
+    else autoscroll_start();
+}
+
+/* delta_ms > 0 = 빠르게 (지연 줄임) */
+static void autoscroll_change_speed(int delta_ms) {
+    int v = g_state.autoscroll_delay_ms - delta_ms;
+    if (v < AUTOSCROLL_MIN_MS) v = AUTOSCROLL_MIN_MS;
+    if (v > AUTOSCROLL_MAX_MS) v = AUTOSCROLL_MAX_MS;
+    if (v == g_state.autoscroll_delay_ms) return;
+    g_state.autoscroll_delay_ms = v;
+    if (g_state.autoscroll_active) {
+        KillTimer(g_state.hwnd, AUTOSCROLL_TIMER_ID);
+        SetTimer(g_state.hwnd, AUTOSCROLL_TIMER_ID, (UINT)v, NULL);
+    }
+}
+
+/* ------------------------------------------------------------------
+ * 폰트 크기 / 줄 간격 / 자간 변경 — 휠+모디파이어 또는 메뉴/단축키 공용.
+ * ------------------------------------------------------------------ */
+static void font_change(int delta) {
+    int new_size = g_state.font_size + delta;
+    if (new_size < 6) new_size = 6;
+    if (new_size > 48) new_size = 48;
+    if (new_size == g_state.font_size) return;
+    g_state.font_size = new_size;
+    create_font();
+    g_state.visible_lines = g_state.client_h / line_total_height();
+    measure_max_line_width();
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+static void line_spacing_change(int delta) {
+    int v = g_state.line_spacing_extra + delta;
+    if (v < 0)  v = 0;
+    if (v > 32) v = 32;
+    if (v == g_state.line_spacing_extra) return;
+    g_state.line_spacing_extra = v;
+    g_state.visible_lines = g_state.client_h / line_total_height();
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
+}
+
+static void char_spacing_change(int delta) {
+    int v = g_state.char_spacing_extra + delta;
+    if (v < 0)  v = 0;
+    if (v > 16) v = 16;
+    if (v == g_state.char_spacing_extra) return;
+    g_state.char_spacing_extra = v;
+    measure_max_line_width();
+    update_scrollbars();
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
 }
 
 /* ------------------------------------------------------------------
@@ -865,6 +1033,89 @@ static void cmd_goto_line(void) {
         if (line > g_state.line_count) line = g_state.line_count;
         scroll_to_line(line - 1);
     }
+}
+
+/* ------------------------------------------------------------------
+ * 책갈피 — 줄 번호 정렬 배열로 보관. 세션 한정 (영속화는 후속 phase).
+ *
+ * 토글 기준은 top_line (가장 위에 보이는 줄). 캐럿이 없으므로
+ * "현재 위치 = 시작 위치"로 정의.
+ * ------------------------------------------------------------------ */
+static int bookmark_index_of(int line) {
+    for (int i = 0; i < g_state.bookmark_count; i++) {
+        if (g_state.bookmarks[i] == line) return i;
+    }
+    return -1;
+}
+
+static BOOL bookmark_has(int line) {
+    return bookmark_index_of(line) >= 0;
+}
+
+static void cmd_bookmark_toggle(void) {
+    if (g_state.line_count == 0) return;
+    int line = g_state.top_line;
+    int idx = bookmark_index_of(line);
+    if (idx >= 0) {
+        for (int j = idx; j < g_state.bookmark_count - 1; j++)
+            g_state.bookmarks[j] = g_state.bookmarks[j + 1];
+        g_state.bookmark_count--;
+    } else if (g_state.bookmark_count < MAX_BOOKMARKS) {
+        int pos = g_state.bookmark_count;
+        while (pos > 0 && g_state.bookmarks[pos - 1] > line) {
+            g_state.bookmarks[pos] = g_state.bookmarks[pos - 1];
+            pos--;
+        }
+        g_state.bookmarks[pos] = line;
+        g_state.bookmark_count++;
+    }
+    InvalidateRect(g_state.hwnd, NULL, FALSE);
+}
+
+static void cmd_bookmark_jump(BOOL forward) {
+    if (g_state.bookmark_count == 0) return;
+    int curr = g_state.top_line;
+    int target = -1;
+    if (forward) {
+        for (int i = 0; i < g_state.bookmark_count; i++) {
+            if (g_state.bookmarks[i] > curr) {
+                target = g_state.bookmarks[i];
+                break;
+            }
+        }
+        if (target < 0) target = g_state.bookmarks[0];     /* wrap */
+    } else {
+        for (int i = g_state.bookmark_count - 1; i >= 0; i--) {
+            if (g_state.bookmarks[i] < curr) {
+                target = g_state.bookmarks[i];
+                break;
+            }
+        }
+        if (target < 0)
+            target = g_state.bookmarks[g_state.bookmark_count - 1];
+    }
+    scroll_to_line(target);
+}
+
+static void cmd_bookmark_clear(void) {
+    if (g_state.bookmark_count == 0) return;
+    g_state.bookmark_count = 0;
+    InvalidateRect(g_state.hwnd, NULL, FALSE);
+}
+
+/* ------------------------------------------------------------------
+ * 다크 모드 토글
+ * ------------------------------------------------------------------ */
+static void cmd_toggle_dark_mode(void) {
+    g_state.dark_mode = !g_state.dark_mode;
+    HMENU menu = GetMenu(g_state.hwnd);
+    if (!menu) menu = g_state.fs_menu;
+    if (menu) {
+        CheckMenuItem(menu, IDM_DARK_MODE,
+                      MF_BYCOMMAND | (g_state.dark_mode ?
+                                      MF_CHECKED : MF_UNCHECKED));
+    }
+    InvalidateRect(g_state.hwnd, NULL, TRUE);
 }
 
 /* ------------------------------------------------------------------
@@ -1086,6 +1337,8 @@ static HMENU create_menu(void) {
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view_menu, MF_STRING, IDM_LINENO,
                 L"줄 번호 표시(&L)\tCtrl+L");
+    AppendMenuW(view_menu, MF_STRING, IDM_DARK_MODE,
+                L"다크 모드(&D)\tCtrl+D");
     AppendMenuW(view_menu, MF_STRING, IDM_FULLSCREEN,
                 L"전체화면(&F)\tF11");
     AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
@@ -1097,6 +1350,15 @@ static HMENU create_menu(void) {
                 L"이전 찾기\tShift+F3");
     AppendMenuW(view_menu, MF_STRING, IDM_GOTO,
                 L"줄 이동(&G)...\tCtrl+G");
+    AppendMenuW(view_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(view_menu, MF_STRING, IDM_BM_TOGGLE,
+                L"책갈피 추가/제거(&B)\tCtrl+B");
+    AppendMenuW(view_menu, MF_STRING, IDM_BM_NEXT,
+                L"다음 책갈피\tF2");
+    AppendMenuW(view_menu, MF_STRING, IDM_BM_PREV,
+                L"이전 책갈피\tShift+F2");
+    AppendMenuW(view_menu, MF_STRING, IDM_BM_CLEAR,
+                L"책갈피 모두 지우기");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)view_menu, L"보기(&V)");
 
     HMENU enc_menu = CreatePopupMenu();
@@ -1107,6 +1369,7 @@ static HMENU create_menu(void) {
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF16BE, L"UTF-16 BE");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_CP949,   L"CP949 (EUC-KR)");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_JOHAB,   L"조합형 (Johab)");
+    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_SJIS,    L"Shift-JIS (일본어)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)enc_menu, L"인코딩(&E)");
 
     HMENU help_menu = CreatePopupMenu();
@@ -1133,7 +1396,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_state.client_w = LOWORD(lp);
         g_state.client_h = HIWORD(lp);
         if (g_state.char_height > 0) {
-            g_state.visible_lines = g_state.client_h / g_state.char_height;
+            g_state.visible_lines = g_state.client_h / line_total_height();
         }
         update_scrollbars();
         return 0;
@@ -1141,6 +1404,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_PAINT:
         on_paint(hwnd);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == AUTOSCROLL_TIMER_ID) {
+            int max_top = g_state.line_count - g_state.visible_lines;
+            if (max_top < 0) max_top = 0;
+            if (g_state.top_line >= max_top) autoscroll_stop();
+            else scroll_to_line(g_state.top_line + 1);
+        }
         return 0;
 
     case WM_ERASEBKGND:
@@ -1183,12 +1455,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEWHEEL: {
-        int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        UINT lines_per_notch = 3;
-        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0,
-                              &lines_per_notch, 0);
-        int lines = -(delta / WHEEL_DELTA) * (int)lines_per_notch;
-        scroll_to_line(g_state.top_line + lines);
+        int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+        WORD keys = GET_KEYSTATE_WPARAM(wp);
+        BOOL ctrl  = (keys & MK_CONTROL) != 0;
+        BOOL shift = (keys & MK_SHIFT)   != 0;
+        if (ctrl && shift) {
+            char_spacing_change(notches);
+        } else if (ctrl) {
+            font_change(notches);
+        } else if (shift) {
+            line_spacing_change(notches);
+        } else if (g_state.autoscroll_active) {
+            /* 자동 스크롤 진행 중: 휠로 속도 조절 (위=빠름) */
+            autoscroll_change_speed(notches * 25);
+        } else {
+            UINT lines_per_notch = 3;
+            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0,
+                                  &lines_per_notch, 0);
+            int lines = -notches * (int)lines_per_notch;
+            scroll_to_line(g_state.top_line + lines);
+        }
         return 0;
     }
 
@@ -1219,6 +1505,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'F':
             if (ctrl) cmd_find();
             break;
+        case 'D':
+            if (ctrl) cmd_toggle_dark_mode();
+            break;
+        case 'B':
+            if (ctrl) cmd_bookmark_toggle();
+            break;
+        case VK_F2: {
+            int shift = GetKeyState(VK_SHIFT) & 0x8000;
+            cmd_bookmark_jump(shift ? FALSE : TRUE);
+            break;
+        }
         case VK_F3: {
             int shift = GetKeyState(VK_SHIFT) & 0x8000;
             cmd_find_again(shift ? FALSE : TRUE);
@@ -1227,32 +1524,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_F11:
             cmd_toggle_fullscreen();
             break;
+        case VK_SPACE:
+            autoscroll_toggle();
+            break;
         case VK_ESCAPE:
-            if (g_state.fs_active) cmd_toggle_fullscreen();
+            if (g_state.autoscroll_active) autoscroll_stop();
+            else if (g_state.fs_active) cmd_toggle_fullscreen();
             break;
         case VK_OEM_PERIOD:  /* '.' 키 */
-            if (ctrl && g_state.font_size < 48) {
-                g_state.font_size++;
-                create_font();
-                if (g_state.char_height > 0)
-                    g_state.visible_lines = g_state.client_h /
-                                            g_state.char_height;
-                measure_max_line_width();
-                update_scrollbars();
-                InvalidateRect(hwnd, NULL, TRUE);
-            }
+            if (ctrl) font_change(+1);
             break;
         case VK_OEM_COMMA:   /* ',' 키 */
-            if (ctrl && g_state.font_size > 6) {
-                g_state.font_size--;
-                create_font();
-                if (g_state.char_height > 0)
-                    g_state.visible_lines = g_state.client_h /
-                                            g_state.char_height;
-                measure_max_line_width();
-                update_scrollbars();
-                InvalidateRect(hwnd, NULL, TRUE);
-            }
+            if (ctrl) font_change(-1);
             break;
         }
         return 0;
@@ -1264,36 +1547,24 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_EXIT:        DestroyWindow(hwnd); break;
         case IDM_GOTO:        cmd_goto_line(); break;
         case IDM_LINENO:      cmd_toggle_line_numbers(); break;
+        case IDM_DARK_MODE:   cmd_toggle_dark_mode(); break;
         case IDM_FULLSCREEN:  cmd_toggle_fullscreen(); break;
         case IDM_FIND:        cmd_find(); break;
         case IDM_FIND_NEXT:   cmd_find_again(TRUE); break;
         case IDM_FIND_PREV:   cmd_find_again(FALSE); break;
-        case IDM_FONT_INC:
-            SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_PERIOD, 0);
-            /* Ctrl 상태가 아니라 메뉴에서는 직접 처리 */
-            if (g_state.font_size < 48) {
-                g_state.font_size++;
-                create_font();
-                measure_max_line_width();
-                update_scrollbars();
-                InvalidateRect(hwnd, NULL, TRUE);
-            }
-            break;
-        case IDM_FONT_DEC:
-            if (g_state.font_size > 6) {
-                g_state.font_size--;
-                create_font();
-                measure_max_line_width();
-                update_scrollbars();
-                InvalidateRect(hwnd, NULL, TRUE);
-            }
-            break;
+        case IDM_BM_TOGGLE:   cmd_bookmark_toggle(); break;
+        case IDM_BM_NEXT:     cmd_bookmark_jump(TRUE); break;
+        case IDM_BM_PREV:     cmd_bookmark_jump(FALSE); break;
+        case IDM_BM_CLEAR:    cmd_bookmark_clear(); break;
+        case IDM_FONT_INC:     font_change(+1); break;
+        case IDM_FONT_DEC:     font_change(-1); break;
         case IDM_ENC_AUTO:    reload_with_encoding(ENC_UNKNOWN); break;
         case IDM_ENC_UTF8:    reload_with_encoding(ENC_UTF8); break;
         case IDM_ENC_UTF16LE: reload_with_encoding(ENC_UTF16_LE); break;
         case IDM_ENC_UTF16BE: reload_with_encoding(ENC_UTF16_BE); break;
         case IDM_ENC_CP949:   reload_with_encoding(ENC_CP949); break;
         case IDM_ENC_JOHAB:   reload_with_encoding(ENC_JOHAB); break;
+        case IDM_ENC_SJIS:    reload_with_encoding(ENC_SJIS); break;
         case IDM_ABOUT:
             MessageBoxW(hwnd,
                 L"hview — Win32 한글 텍스트 뷰어\n"
