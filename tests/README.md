@@ -26,12 +26,14 @@ build.bat
 `encoding.h`는 Win32 API(`MultiByteToWideChar` 등)에 의존하므로 비-Windows
 플랫폼에서는 `_WIN32` 가드로 자동 스킵된다. johab.h는 순수 C라 어디서나 빌드된다.
 
-## 현재 커버리지 (Phase 0 — v0.1.0 잠금)
+## 현재 커버리지
 
 | 모듈 | 테스트 수 | 비고 |
 |------|---------:|------|
-| `johab.h` | 18 | 디코더, 점수, UTF-16 변환 |
-| `encoding.h` | 17 | BOM, UTF-8 유효성, CP949 점수, 변환 디스패치 |
+| `johab.h` | 18 | 디코더, 점수, UTF-16 변환 (Phase 0) |
+| `sjis.h`  |  5 | 점수 휴리스틱 (Phase 5) |
+| `hanja.h` | 15 | 한자/가나 → 한글 음, CJK/가나 범위 판별 (Phase 6) |
+| `encoding.h` | 17 | BOM, UTF-8 유효성, CP949 점수, 변환 디스패치 (Win32 전용) |
 
 ## 향후 phase별 추가
 

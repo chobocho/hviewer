@@ -26,6 +26,7 @@
  * ------------------------------------------------------------------ */
 #include "../johab.h"
 #include "../sjis.h"
+#include "../hanja.h"
 
 #ifdef _WIN32
 # include "../encoding.h"
@@ -234,6 +235,108 @@ TEST(sjis_score_invalid_lead_zero) {
     /* 0x80, 0xA0, 0xFD-0xFF — SJIS lead/kana 어디에도 안 맞음 */
     const unsigned char buf[] = { 0x80, 0xA0, 0xFE, 0xFF };
     ASSERT_EQ(sjis_score(buf, sizeof(buf)), 0);
+}
+
+/* ==================================================================
+ * Phase 6 — hanja.h (한자 → 한글 음, 가나 → 한글 음, 범위 판별)
+ *
+ * 순수 C — 어디서나 빌드. hview.c의 한자 음 표시 토글이 사용.
+ * ================================================================== */
+
+TEST(hanja_known_mapping_il) {
+    /* 一 (U+4E00) → 일 (U+C77C) */
+    ASSERT_EQ(hanja_to_hangul(0x4E00), 0xC77Cu);
+}
+
+TEST(hanja_known_mapping_in) {
+    /* 人 (U+4EBA) → 인 (U+C778) */
+    ASSERT_EQ(hanja_to_hangul(0x4EBA), 0xC778u);
+}
+
+TEST(hanja_known_mapping_il_day) {
+    /* 日 (U+65E5) → 일 (U+C77C) — 동음이체자도 같은 한글 음 */
+    ASSERT_EQ(hanja_to_hangul(0x65E5), 0xC77Cu);
+}
+
+TEST(hanja_known_mapping_han) {
+    /* 漢 (U+6F22) → 한 (U+D55C) */
+    ASSERT_EQ(hanja_to_hangul(0x6F22), 0xD55Cu);
+}
+
+TEST(hanja_below_range_is_zero) {
+    /* CJK 영역 미만 — 한글 영역(0xAC00) 자체도 한자 아님 */
+    ASSERT_EQ(hanja_to_hangul(0x4DFF), 0u);
+    ASSERT_EQ(hanja_to_hangul(0xAC00), 0u);
+    ASSERT_EQ(hanja_to_hangul(L'A'),   0u);
+}
+
+TEST(hanja_above_range_is_zero) {
+    /* CJK Unified Ideographs 0x4E00~0x9FFF 초과 */
+    ASSERT_EQ(hanja_to_hangul(0xA000), 0u);
+    ASSERT_EQ(hanja_to_hangul(0xFFFF), 0u);
+}
+
+TEST(hanja_in_range_unmapped_is_zero) {
+    /* 영역 내지만 테이블에 없는 한자 — 0 반환 (호출자가 원본 유지하도록 신호) */
+    ASSERT_EQ(hanja_to_hangul(0x4E02), 0u);
+}
+
+TEST(kana_hiragana_a) {
+    /* あ (U+3042) → 아 */
+    const wchar_t *r = kana_to_hangul(0x3042);
+    ASSERT_TRUE(r != NULL);
+    ASSERT_EQ(r[0], 0xC544);   /* 아 */
+}
+
+TEST(kana_hiragana_n) {
+    /* ん (U+3093) → 응 */
+    const wchar_t *r = kana_to_hangul(0x3093);
+    ASSERT_TRUE(r != NULL);
+    ASSERT_EQ(r[0], 0xC751);   /* 응 */
+}
+
+TEST(kana_katakana_normalized_to_hiragana) {
+    /* ア (U+30A2) → あ → 아 — 카타카나도 동일 음 반환 */
+    const wchar_t *r = kana_to_hangul(0x30A2);
+    ASSERT_TRUE(r != NULL);
+    ASSERT_EQ(r[0], 0xC544);
+}
+
+TEST(kana_out_of_range_is_null) {
+    ASSERT_TRUE(kana_to_hangul(L'A')   == NULL);
+    ASSERT_TRUE(kana_to_hangul(0x3000) == NULL);
+    ASSERT_TRUE(kana_to_hangul(0xAC00) == NULL);
+}
+
+TEST(is_cjk_unified_range) {
+    ASSERT_TRUE(is_cjk(0x4E00));
+    ASSERT_TRUE(is_cjk(0x9FFF));
+    ASSERT_FALSE(is_cjk(0x4DFF));
+    ASSERT_FALSE(is_cjk(0xA000));
+}
+
+TEST(is_cjk_extension_a_and_compat) {
+    ASSERT_TRUE(is_cjk(0x3400));    /* Extension A */
+    ASSERT_TRUE(is_cjk(0x4DBF));
+    ASSERT_TRUE(is_cjk(0xF900));    /* Compatibility Ideographs */
+    ASSERT_TRUE(is_cjk(0xFAFF));
+    ASSERT_FALSE(is_cjk(0xFB00));
+}
+
+TEST(is_cjk_rejects_hangul_and_ascii) {
+    ASSERT_FALSE(is_cjk(0xAC00));   /* 가 — 한글 음절 */
+    ASSERT_FALSE(is_cjk(L'A'));
+    ASSERT_FALSE(is_cjk(0x3042));   /* 히라가나 */
+}
+
+TEST(is_kana_hiragana_and_katakana) {
+    ASSERT_TRUE(is_kana(0x3041));   /* ぁ */
+    ASSERT_TRUE(is_kana(0x309F));
+    ASSERT_TRUE(is_kana(0x30A0));   /* ・ */
+    ASSERT_TRUE(is_kana(0x30FF));
+    ASSERT_FALSE(is_kana(0x3040));  /* 가나 직전 */
+    ASSERT_FALSE(is_kana(0x3100));  /* 가나 직후 */
+    ASSERT_FALSE(is_kana(0x4E00));  /* 한자 */
 }
 
 /* ==================================================================
@@ -453,6 +556,23 @@ int main(void) {
     RUN(sjis_score_half_width_kana_all_hits);
     RUN(sjis_score_two_byte_kanji_all_hits);
     RUN(sjis_score_invalid_lead_zero);
+
+    printf("\n[hanja.h]\n");
+    RUN(hanja_known_mapping_il);
+    RUN(hanja_known_mapping_in);
+    RUN(hanja_known_mapping_il_day);
+    RUN(hanja_known_mapping_han);
+    RUN(hanja_below_range_is_zero);
+    RUN(hanja_above_range_is_zero);
+    RUN(hanja_in_range_unmapped_is_zero);
+    RUN(kana_hiragana_a);
+    RUN(kana_hiragana_n);
+    RUN(kana_katakana_normalized_to_hiragana);
+    RUN(kana_out_of_range_is_null);
+    RUN(is_cjk_unified_range);
+    RUN(is_cjk_extension_a_and_compat);
+    RUN(is_cjk_rejects_hangul_and_ascii);
+    RUN(is_kana_hiragana_and_katakana);
 
 #ifdef _WIN32
     printf("\n[encoding.h]\n");
