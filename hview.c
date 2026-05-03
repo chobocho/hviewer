@@ -250,6 +250,13 @@ static const Theme *theme(void) {
 /* 전방 선언 — 정의 순서가 어긋나는 경우만 */
 static void recent_add(const wchar_t *path);
 static void rebuild_render_lines_preserve(void);
+static void autoscroll_stop(void);
+static int  selection_start(void);
+static int  selection_end(void);
+static BOOL has_selection(void);
+static void selection_clear(void);
+static int  line_for_offset(int offset);
+static BOOL bookmark_has(int line);
 
 /* ------------------------------------------------------------------
  * 유틸리티
