@@ -37,7 +37,7 @@
  * ================================================================== */
 
 /*
- * 각 음절 → johab 2바이트 매핑 검산 (직접 비트 계산):
+ * 각 음절 → johab 2바이트 매핑 검산 (KS X 1001 부속서 3 / CP1361):
  *
  *   '가' U+AC00: cho=0(ㄱ), jung=0(ㅏ), jong=0
  *      bits = (cho_bit=2, jung_bit=3, jong_bit=1)
@@ -48,12 +48,12 @@
  *      code = 0x8000 | (20<<10) | (3<<5) | 5 = 0xD065 → bytes 0xD0 0x65
  *
  *   '글' U+AE00: cho=0(ㄱ), jung=18(ㅡ), jong=8(ㄹ)
- *      bits = (2, 26, 10)
- *      code = 0x8000 | (2<<10) | (26<<5) | 10 = 0x8B4A → bytes 0x8B 0x4A
+ *      bits = (2, 27, 9)
+ *      code = 0x8000 | (2<<10) | (27<<5) | 9 = 0x8B69 → bytes 0x8B 0x69
  *
  *   '힣' U+D7A3: cho=18(ㅎ), jung=20(ㅣ), jong=27(ㅎ)
- *      bits = (20, 30, 31)
- *      code = 0x8000 | (20<<10) | (30<<5) | 31 = 0xD3DF → bytes 0xD3 0xDF
+ *      bits = (20, 29, 29)
+ *      code = 0x8000 | (20<<10) | (29<<5) | 29 = 0xD3BD → bytes 0xD3 0xBD
  */
 
 TEST(johab_decode_ga) {
@@ -68,12 +68,12 @@ TEST(johab_decode_han) {
 
 TEST(johab_decode_geul) {
     /* '글' */
-    ASSERT_EQ(johab_decode_syllable(0x8B4A), 0xAE00u);
+    ASSERT_EQ(johab_decode_syllable(0x8B69), 0xAE00u);
 }
 
 TEST(johab_decode_hih) {
     /* '힣' — 마지막 한글 음절 (모든 인덱스 최대) */
-    ASSERT_EQ(johab_decode_syllable(0xD3DF), 0xD7A3u);
+    ASSERT_EQ(johab_decode_syllable(0xD3BD), 0xD7A3u);
 }
 
 TEST(johab_decode_rejects_msb_zero) {
@@ -118,8 +118,8 @@ TEST(johab_score_all_valid_johab_is_100) {
     const unsigned char buf[] = {
         0x88, 0x61,  /* 가 */
         0xD0, 0x65,  /* 한 */
-        0x8B, 0x4A,  /* 글 */
-        0xD3, 0xDF,  /* 힣 */
+        0x8B, 0x69,  /* 글 */
+        0xD3, 0xBD,  /* 힣 */
     };
     ASSERT_EQ(johab_score(buf, sizeof(buf)), 100);
 }
@@ -149,7 +149,7 @@ TEST(johab_to_utf16_ascii_passthrough) {
 TEST(johab_to_utf16_known_syllables) {
     /* '가한글힣' */
     const unsigned char src[] = {
-        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x4A, 0xD3, 0xDF,
+        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x69, 0xD3, 0xBD,
     };
     wchar_t dst[16] = {0};
     size_t n = johab_to_utf16(src, sizeof(src), dst);
@@ -381,6 +381,35 @@ TEST(detect_pure_ascii_defaults_to_cp949) {
     ASSERT_EQ(detect_encoding(buf, sizeof(buf) - 1), ENC_CP949);
 }
 
+TEST(detect_johab_real_korean_text) {
+    /* "에이치 뷰어는 한글코드를 완"의 실제 Johab 바이트. 일반 한글
+     * 텍스트라 cp949_score와 johab_score가 모두 100인 동률 케이스 —
+     * 점수만으로는 구분 불가.
+     *
+     * 보조 영역 휴리스틱이 동작해야 정확히 ENC_JOHAB으로 판별됨:
+     *   trail 바이트가 0x41/0x61/0x65/0x69 등 0x41~0x7A에 자주 떨어짐 →
+     *   cp949_extension_ratio >= 30% → Johab으로 결정. */
+    const unsigned char buf[] = {
+        0xB5, 0x41,  /* 에 */
+        0xB7, 0xA1,  /* 이 */
+        0xC3, 0xA1,  /* 치 */
+        0x20,        /* space */
+        0xA7, 0x41,  /* 뷰 */
+        0xB4, 0xE1,  /* 어 */
+        0x93, 0x65,  /* 는 */
+        0x20,        /* space */
+        0xD0, 0x65,  /* 한 */
+        0x8B, 0x69,  /* 글 */
+        0xC5, 0xA1,  /* 코 */
+        0x97, 0x61,  /* 드 */
+        0x9F, 0x69,  /* 를 */
+        0x20,        /* space */
+        0xB5, 0xC5,  /* 완 */
+    };
+    Encoding got = detect_encoding(buf, sizeof(buf));
+    ASSERT_EQ(got, ENC_JOHAB);
+}
+
 TEST(detect_johab_bytes) {
     /* CP949 valid trail 영역(0x41~0x5A, 0x61~0x7A, 0x81~0xFE)을
      * 모두 벗어나는 trail 바이트로 구성된 Johab 음절들.
@@ -388,20 +417,20 @@ TEST(detect_johab_bytes) {
      * Johab 비트 구조:  code = 1<<15 | cho_bits<<10 | jung_bits<<5 | jong_bits
      *                  trail = (jung_bits & 7) << 5 | jong_bits
      *
-     * jung_bits=16 → 하위 3비트=0 → trail = jong_bits (1~31)
-     *   ⇒ trail ∈ 0x01~0x1F, 모두 CP949 invalid trail.
+     * jung_bits=10(ㅔ) → 하위 3비트=2 → trail = 0x40 + jong_bits
+     *   jong_bits=27..29 (ㅋ,ㅌ,ㅍ) → trail 0x5B..0x5D — CP949 invalid trail.
      *
      * 그러므로 cp949_score = 0, sjis_score = 0, johab_score = 100
      *   → 점수 비교에서 동률 없이 ENC_JOHAB로 판별. */
     const unsigned char buf[] = {
-        0x8A, 0x01,  /* cho_bits=2(ㄱ), jung_bits=16, jong_bits=1  → 음절 */
-        0x92, 0x01,  /* cho_bits=4(ㄴ), jung_bits=16, jong_bits=1  → 음절 */
-        0x8A, 0x04,  /* cho_bits=2,    jung_bits=16, jong_bits=4  → 음절 */
-        0x92, 0x04,  /* cho_bits=4,    jung_bits=16, jong_bits=4  → 음절 */
-        0x8A, 0x08,  /* cho_bits=2,    jung_bits=16, jong_bits=8  → 음절 */
-        0x92, 0x08,  /* cho_bits=4,    jung_bits=16, jong_bits=8  → 음절 */
-        0x8A, 0x0E,  /* cho_bits=2,    jung_bits=16, jong_bits=14 → 음절 */
-        0x92, 0x0E,  /* cho_bits=4,    jung_bits=16, jong_bits=14 → 음절 */
+        0x89, 0x5B,  /* cho_bits=2(ㄱ), jung_bits=10(ㅔ), jong_bits=27(ㅋ) */
+        0x91, 0x5B,  /* cho_bits=4(ㄴ), jung_bits=10,    jong_bits=27 */
+        0x89, 0x5C,  /* cho_bits=2,    jung_bits=10,    jong_bits=28(ㅌ) */
+        0x91, 0x5C,  /* cho_bits=4,    jung_bits=10,    jong_bits=28 */
+        0x89, 0x5D,  /* cho_bits=2,    jung_bits=10,    jong_bits=29(ㅍ) */
+        0x91, 0x5D,  /* cho_bits=4,    jung_bits=10,    jong_bits=29 */
+        0x89, 0x5B,  /* (반복으로 8 음절 채움) */
+        0x91, 0x5B,
     };
     Encoding got = detect_encoding(buf, sizeof(buf));
     ASSERT_EQ(got, ENC_JOHAB);
@@ -595,6 +624,7 @@ int main(void) {
     RUN(detect_utf16_be_bom);
     RUN(detect_utf8_no_bom_with_multibyte);
     RUN(detect_pure_ascii_defaults_to_cp949);
+    RUN(detect_johab_real_korean_text);
     RUN(detect_johab_bytes);
     RUN(utf8_validity_rejects_invalid_lead);
     RUN(utf8_validity_rejects_bad_continuation);

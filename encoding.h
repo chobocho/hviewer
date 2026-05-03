@@ -155,6 +155,38 @@ static int cp949_score(const unsigned char *buf, size_t len) {
 }
 
 /* ------------------------------------------------------------------
+ * CP949 "확장 영역" 비율 — Johab 식별 보조.
+ *
+ * 표준 KS X 1001(EUC-KR) 한글은 lead 0xA1~0xC6 + trail 0xA1~0xFE 영역에
+ * 모여 있다. 그 외 lead 0x81~0xA0 또는 trail 0x41~0x7A는 CP949가
+ * UHC로 확장하면서 추가한 "사용 빈도가 낮은 보조 영역"이다.
+ *
+ * 일반 한글 텍스트(소설, 기사, 문서)를 CP949로 저장하면 보조 영역
+ * 비율이 거의 0%에 가깝다. 반면 같은 텍스트가 Johab으로 저장되면
+ * 비트 압축 구조 때문에 trail 바이트가 0x41~0x7A에 자주 떨어진다.
+ *
+ * 따라서 보조 영역 비율이 높으면(>=30%) Johab일 확률이 압도적이다.
+ * detect_encoding의 동률(cp_score == jh_score) 처리에 사용.
+ *
+ * 반환: 0~100 (모든 2바이트 시퀀스 중 보조 영역 위치한 쌍의 비율)
+ * ------------------------------------------------------------------ */
+static int cp949_extension_ratio(const unsigned char *buf, size_t len) {
+    size_t pairs = 0, ext = 0;
+    size_t i = 0;
+    while (i + 1 < len) {
+        unsigned char b0 = buf[i];
+        if (b0 < 0x80) { i++; continue; }
+        unsigned char b1 = buf[i + 1];
+        pairs++;
+        if (b0 >= 0x81 && b0 <= 0xA0) ext++;
+        else if (b1 >= 0x41 && b1 <= 0x7A) ext++;
+        i += 2;
+    }
+    if (pairs == 0) return 0;
+    return (int)((ext * 100) / pairs);
+}
+
+/* ------------------------------------------------------------------
  * 인코딩 자동 판별.
  *
  * 입력: 파일 앞부분 (최소 4바이트, 권장 64KB)
@@ -190,6 +222,14 @@ static Encoding detect_encoding(const unsigned char *buf, size_t len) {
     /* 둘 다 낮으면 ASCII거나 식별 불가 — CP949 기본값
      * (Windows 한글 환경 표준) */
     if (cp < 50 && jh < 50) return ENC_CP949;
+
+    /* 동률 또는 비슷한 점수일 때:
+     * Johab은 비트 패킹 구조상 trail 0x41~0x7A에 한글 자주 떨어진다.
+     * 같은 한글 텍스트를 CP949로 저장하면 보조 영역(lead 0x81~0xA0 또는
+     * trail 0x41~0x7A) 비율이 보통 0%에 가깝다.
+     * 따라서 johab도 valid하면서 보조 영역 비율이 높으면 Johab으로 판정. */
+    if (jh >= 80 && cp949_extension_ratio(buf, len) >= 30)
+        return ENC_JOHAB;
 
     /* 조합형은 더 엄격한 패턴이라 비슷한 점수면 CP949 우선 */
     if (jh > cp + 10) return ENC_JOHAB;
