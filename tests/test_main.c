@@ -227,6 +227,22 @@ TEST(johab_hangul_count_skips_ascii_and_invalid) {
     ASSERT_EQ(johab_hangul_count(buf, sizeof(buf)), 3u);
 }
 
+TEST(johab_to_utf16_output_count_bounded_by_src_len) {
+    /* dst 버퍼 크기 가정 잠금 — convert_to_utf16의 ENC_JOHAB 분기는
+     * (src_len+1) wchar_t를 할당한다. 모든 분기(ASCII/valid/invalid/잘림)에서
+     * 출력 wchar_t 개수가 src_len을 넘지 않아야 그 가정이 안전하다. */
+    const unsigned char src[] = {
+        'A',                /* ASCII: 1B → 1w */
+        0x88, 0x61,         /* valid 가: 2B → 1w */
+        0x80, 0x00,         /* invalid pair: 2B → 1w (FFFD) */
+        0xD0,               /* 잘린 lead: 1B → 1w (FFFD) */
+    };
+    wchar_t dst[16] = {0};
+    size_t n = johab_to_utf16(src, sizeof(src), dst);
+    ASSERT_TRUE(n <= sizeof(src));
+    ASSERT_EQ(n, 4u);
+}
+
 /* ==================================================================
  * Phase 5 — sjis.h (휴리스틱 스코어, 순수 C — 어디서나 빌드)
  * ================================================================== */
@@ -460,6 +476,25 @@ TEST(detect_pure_ascii_defaults_to_cp949) {
     ASSERT_EQ(detect_encoding(buf, sizeof(buf) - 1), ENC_CP949);
 }
 
+TEST(detect_empty_buffer_falls_back_to_cp949) {
+    /* 빈 입력은 BOM 검사·점수 휴리스틱 모두 0 → CP949 default 분기.
+     * NULL 호출도 안전해야 함 (모든 score 함수가 길이 0에서 즉시 0 반환). */
+    ASSERT_EQ(detect_encoding(NULL, 0), ENC_CP949);
+    ASSERT_EQ(detect_encoding((const unsigned char*)"", 0), ENC_CP949);
+}
+
+TEST(detect_sjis_japanese_text) {
+    /* "日本語日本語" SJIS — sjis_score > cp949_score + 20 분기 검증.
+     *   日 = 0x93 0xFA,  本 = 0x96 0x7B,  語 = 0x8C 0xEA
+     * 0x96 0x7B의 trail 0x7B는 SJIS valid(0x40-0x7E)이지만 CP949 invalid
+     * (CP949 trail은 0x7A까지)이므로 cp949_score가 떨어진다 → SJIS 우선. */
+    const unsigned char buf[] = {
+        0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA,
+        0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA,
+    };
+    ASSERT_EQ(detect_encoding(buf, sizeof(buf)), ENC_SJIS);
+}
+
 TEST(detect_johab_real_korean_text) {
     /* "에이치 뷰어는 한글코드를 완"의 실제 Johab 바이트. 일반 한글
      * 텍스트라 cp949_score와 johab_score가 모두 100인 동률 케이스 —
@@ -585,17 +620,6 @@ TEST(convert_utf16_be_byteswap) {
     free(out);
 }
 
-TEST(convert_johab_dispatches_correctly) {
-    /* '가' 조합형 */
-    const unsigned char buf[] = { 0x88, 0x61 };
-    size_t wlen = 0;
-    wchar_t *out = convert_to_utf16(buf, sizeof(buf), ENC_JOHAB, &wlen);
-    ASSERT_TRUE(out != NULL);
-    ASSERT_EQ(wlen, 1u);
-    ASSERT_EQ(out[0], 0xAC00);
-    free(out);
-}
-
 TEST(convert_sjis_hiragana_a) {
     /* "あ" SJIS 0x82 0xA0 → U+3042 (UTF-16 1 단위) */
     const unsigned char buf[] = { 0x82, 0xA0 };
@@ -648,11 +672,6 @@ TEST(roundtrip_utf8_korean) {
     ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src), ENC_UTF8, CP_UTF8));
 }
 
-TEST(roundtrip_utf8_ascii) {
-    const unsigned char src[] = "Hello, world.";
-    ASSERT_TRUE(roundtrip_via_wcb(src, sizeof(src) - 1, ENC_UTF8, CP_UTF8));
-}
-
 TEST(roundtrip_cp949_korean) {
     /* "가한" CP949: 0xB0 0xA1 0xC7 0xD1 */
     const unsigned char src[] = { 0xB0, 0xA1, 0xC7, 0xD1 };
@@ -680,17 +699,6 @@ TEST(roundtrip_utf8_bom_strips_then_restores) {
     ASSERT_EQ(back[0], 'a');
     ASSERT_EQ(back[1], 'b');
     ASSERT_EQ(back[2], 'c');
-    free(w);
-}
-
-TEST(roundtrip_empty_string) {
-    /* 빈 입력은 모든 인코딩에서 빈 wide → 빈 출력 */
-    size_t wlen = 0xDEAD;
-    wchar_t *w = convert_to_utf16((const unsigned char*)"", 0, ENC_UTF8, &wlen);
-    ASSERT_TRUE(w != NULL);
-    ASSERT_EQ(wlen, 0u);
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, (int)wlen, NULL, 0, NULL, NULL);
-    ASSERT_EQ(n, 0);
     free(w);
 }
 
@@ -757,6 +765,20 @@ TEST(utf8_validity_rejects_f5_lead) {
     ASSERT_EQ(utf8_validity_score(buf, sizeof(buf)), 0);
 }
 
+TEST(utf8_validity_truncated_last_after_hits) {
+    /* 청크 경계에서 마지막 시퀀스가 잘려도 이전에 hit이 있었다면
+     * 그 hit 카운트만큼 인정 (encoding.h:97~101 특수 처리).
+     * '가' 1자(3B) + 잘린 한글 lead 2바이트 → score=1 */
+    const unsigned char buf[] = { 0xEA, 0xB0, 0x80, 0xEA, 0xB0 };
+    ASSERT_EQ(utf8_validity_score(buf, sizeof(buf)), 1);
+}
+
+TEST(utf8_validity_truncated_first_returns_zero) {
+    /* hit이 한 번도 없는 상태에서 시퀀스가 잘리면 거부. */
+    const unsigned char buf[] = { 0xEA, 0xB0 };
+    ASSERT_EQ(utf8_validity_score(buf, sizeof(buf)), 0);
+}
+
 TEST(convert_unknown_returns_null) {
     /* default 분기 — ENC_UNKNOWN으로 호출하면 NULL.
      *   src_len > 0 이어야 default switch 경로로 진입. */
@@ -765,6 +787,18 @@ TEST(convert_unknown_returns_null) {
     wchar_t *out = convert_to_utf16(buf, sizeof(buf), ENC_UNKNOWN, &wlen);
     ASSERT_TRUE(out == NULL);
     ASSERT_EQ(wlen, 0u);
+}
+
+TEST(convert_unknown_with_empty_returns_empty_buffer) {
+    /* src_len=0 early-return은 인코딩과 무관하게 빈 버퍼를 돌려준다
+     * (encoding.h:262~266) — caller가 항상 free할 수 있도록 NULL 아닌
+     * 1-wchar 종료 버퍼 보장. */
+    size_t wlen = 0xDEAD;
+    wchar_t *out = convert_to_utf16(NULL, 0, ENC_UNKNOWN, &wlen);
+    ASSERT_TRUE(out != NULL);
+    ASSERT_EQ(wlen, 0u);
+    ASSERT_EQ(out[0], 0);
+    free(out);
 }
 
 #endif /* _WIN32 */
@@ -825,6 +859,7 @@ int main(void) {
     RUN(johab_hangul_count_empty);
     RUN(johab_hangul_count_all_valid);
     RUN(johab_hangul_count_skips_ascii_and_invalid);
+    RUN(johab_to_utf16_output_count_bounded_by_src_len);
 
     printf("\n[sjis.h]\n");
     RUN(sjis_score_pure_ascii_zero);
@@ -861,6 +896,8 @@ int main(void) {
     RUN(detect_utf16_be_bom);
     RUN(detect_utf8_no_bom_with_multibyte);
     RUN(detect_pure_ascii_defaults_to_cp949);
+    RUN(detect_empty_buffer_falls_back_to_cp949);
+    RUN(detect_sjis_japanese_text);
     RUN(detect_johab_real_korean_text);
     RUN(detect_johab_bytes);
     RUN(utf8_validity_rejects_invalid_lead);
@@ -872,15 +909,12 @@ int main(void) {
     RUN(convert_utf8_bom_strips_bom);
     RUN(convert_utf16_le_strips_bom);
     RUN(convert_utf16_be_byteswap);
-    RUN(convert_johab_dispatches_correctly);
     RUN(convert_sjis_hiragana_a);
     RUN(convert_empty_input);
     RUN(roundtrip_utf8_korean);
-    RUN(roundtrip_utf8_ascii);
     RUN(roundtrip_cp949_korean);
     RUN(roundtrip_sjis_kana);
     RUN(roundtrip_utf8_bom_strips_then_restores);
-    RUN(roundtrip_empty_string);
     RUN(roundtrip_johab_to_utf16_one_way);
     RUN(encoding_name_lookup_known);
     RUN(cp949_extension_ratio_pure_cp949_low);
@@ -888,7 +922,10 @@ int main(void) {
     RUN(utf8_validity_2byte_sequence);
     RUN(utf8_validity_4byte_emoji);
     RUN(utf8_validity_rejects_f5_lead);
+    RUN(utf8_validity_truncated_last_after_hits);
+    RUN(utf8_validity_truncated_first_returns_zero);
     RUN(convert_unknown_returns_null);
+    RUN(convert_unknown_with_empty_returns_empty_buffer);
 #else
     printf("\n[encoding.h] skipped — requires Win32 (build on MinGW or MSVC)\n");
 #endif

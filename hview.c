@@ -28,7 +28,7 @@
  *   Ctrl+B          책갈피 추가/제거 (현재 위치)
  *   Ctrl+, / Ctrl+. 이전/다음 책갈피
  *   Ctrl+Shift+, / Ctrl+Shift+. 폰트 크기 -/+
- *   F2 / Shift+F2   인코딩 순환 (다음/이전)
+ *   F2 / Shift+F2   인코딩 순환 (CP949↔UTF-8↔Johab; 그 외는 메뉴)
  *   Ctrl+T          목차 (마크다운 # 헤딩)
  *   F11             전체화면 토글 (Esc로도 빠져나옴)
  *   Space           자동 스크롤 토글 (진행 중 휠로 속도 조절)
@@ -117,6 +117,7 @@
 #define IDM_BM_PREV         1042
 #define IDM_BM_CLEAR        1043
 #define IDM_ENC_AUTO        1020
+#define IDM_RECENT_CLEAR    1099
 #define IDM_RECENT_BASE     1100        /* 1100..1109 */
 #define IDM_SEARCH_HIST_BASE 1110       /* 1110..1119 */
 #define IDM_TOC_BASE        2000        /* 2000..2000+toc_count-1 */
@@ -1115,21 +1116,30 @@ static void reload_with_encoding(Encoding enc) {
     load_file(path, enc);
 }
 
-/* 인코딩 순환 — F2(다음) / Shift+F2(이전) */
+/* 인코딩 순환 — F2(다음) / Shift+F2(이전).
+ *
+ * 한국어 텍스트에서 거의 모든 케이스를 커버하는 CP949 / UTF-8 / Johab
+ * 3종만 순환. UTF-16 LE/BE 와 Shift-JIS 는 빈도가 낮아 메뉴에서만 선택.
+ * 현재 인코딩이 cycle 배열 밖이면 첫 항목(CP949)을 시작점으로 잡는다. */
 static void cmd_cycle_encoding(BOOL forward) {
     if (!g_state.filepath[0]) return;
     static const Encoding cycle[] = {
-        ENC_UTF8, ENC_UTF16_LE, ENC_UTF16_BE,
-        ENC_CP949, ENC_JOHAB, ENC_SJIS
+        ENC_CP949, ENC_UTF8, ENC_JOHAB
     };
     const int n = (int)(sizeof(cycle) / sizeof(cycle[0]));
     Encoding cur = g_state.encoding;
     if (cur == ENC_UTF8_BOM) cur = ENC_UTF8;   /* BOM은 UTF-8 슬롯으로 취급 */
     int idx = 0;
+    int found = 0;
     for (int i = 0; i < n; i++) {
-        if (cycle[i] == cur) { idx = i; break; }
+        if (cycle[i] == cur) { idx = i; found = 1; break; }
     }
-    idx = forward ? (idx + 1) % n : (idx - 1 + n) % n;
+    if (found) {
+        idx = forward ? (idx + 1) % n : (idx - 1 + n) % n;
+    }
+    /* found=0 이면 cycle 밖 인코딩(UTF-16/SJIS) — idx=0(CP949)로 진입.
+     * forward/backward 동일하게 첫 항목으로 들어와야 사용자가 F2 한 번에
+     * "한글 3종으로 복귀"한다는 멘탈 모델을 만족한다. */
     reload_with_encoding(cycle[idx]);
 }
 
@@ -2549,66 +2559,207 @@ static void cmd_toggle_line_numbers(void) {
  * ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------
  * 단축키 도움말 — F1 또는 메뉴에서 호출.
- * 파일 상단 키 바인딩 주석과 동기 유지 (변경 시 양쪽 같이).
+ *
+ * MessageBox는 가변폭 폰트 + 단일 컬럼이라 길어지면 화면 밖으로 넘침.
+ * 그래서 prompt_input과 같은 코드 기반 모달 다이얼로그 패턴으로
+ * 좌/우 두 컬럼 + 모노스페이스 폰트(Consolas) 다이얼로그를 직접 띄움.
+ * 외부 .rc 자원 의존성 0 정책 유지.
+ *
+ * 텍스트는 파일 상단 키 바인딩 주석과 동기 유지 (변경 시 양쪽 같이).
  * ------------------------------------------------------------------ */
-static void cmd_show_help(void) {
-    static const wchar_t *help_text =
-        L"[파일]\n"
-        L"  Ctrl+O                     파일 열기\n"
-        L"  Ctrl+S                     다른 이름으로 저장\n"
-        L"\n"
-        L"[편집]\n"
-        L"  Ctrl+C                     선택 영역 복사\n"
-        L"  Ctrl+A                     모두 선택\n"
-        L"  마우스 드래그              텍스트 선택\n"
-        L"  Shift+← / →                한 글자 선택 확장\n"
-        L"  Shift+↑ / ↓                한 줄 선택 확장\n"
-        L"  Shift+Home / End           줄 시작/끝까지 선택\n"
-        L"  Shift+Ctrl+Home / End      문서 시작/끝까지 선택\n"
-        L"\n"
-        L"[찾기 / 이동]\n"
-        L"  Ctrl+F                     찾기 (Esc로 검색 취소)\n"
-        L"  F3 / Shift+F3              다음 / 이전 찾기\n"
-        L"  보기 → 대/소문자 구분, 단어 단위 찾기, 최근 검색어\n"
-        L"  Ctrl+G                     줄 이동\n"
-        L"  Ctrl+T                     목차 (마크다운 # 헤딩)\n"
-        L"\n"
-        L"[책갈피]\n"
-        L"  Ctrl+B                     현재 위치 책갈피 추가/제거\n"
-        L"  Ctrl+, / Ctrl+.            이전 / 다음 책갈피\n"
-        L"\n"
-        L"[보기]\n"
-        L"  Ctrl+L                     줄 번호 표시 토글\n"
-        L"  Ctrl+D                     다크 모드 토글\n"
-        L"  Ctrl+W                     자동 줄바꿈 토글\n"
-        L"  Alt+1                      두 쪽 보기(분할) 토글\n"
-        L"  F11                        전체화면 토글 (Esc로 해제)\n"
-        L"\n"
-        L"[인코딩]\n"
-        L"  F2 / Shift+F2              인코딩 순환 (다음 / 이전)\n"
-        L"\n"
-        L"[폰트]\n"
-        L"  Ctrl+Shift+, / Ctrl+Shift+.  폰트 크기 - / +\n"
-        L"  Ctrl+휠                    폰트 크기 - / +\n"
-        L"  Shift+휠                   줄 간격 조절\n"
-        L"  Ctrl+Shift+휠              자간 조절\n"
-        L"\n"
-        L"[스크롤]\n"
-        L"  ↑ / ↓                      한 줄 스크롤\n"
-        L"  PageUp / PageDown          한 화면 스크롤\n"
-        L"  Home / End                 문서 처음 / 끝\n"
-        L"  Ctrl+Home / Ctrl+End       문서 처음 / 끝\n"
-        L"  ← / →                      가로 스크롤\n"
-        L"  Alt+← / → / ↑ / ↓          여백 조절\n"
-        L"  Space                      자동 스크롤 토글 (진행 중 휠로 속도 조절)\n"
-        L"\n"
-        L"[도움말]\n"
-        L"  F1                         이 도움말";
+typedef struct {
+    HFONT font;
+    int   dpi;
+    int   done;
+} HelpCtx;
+static HelpCtx *g_help;
 
-    MessageBoxW(g_state.hwnd, help_text,
-                L"hViewer 단축키 & 도움말",
-                MB_OK | MB_ICONINFORMATION);
+#define HELP_SCALE(v) MulDiv((v), g_help->dpi, 96)
+
+static BOOL CALLBACK help_set_font(HWND hwnd, LPARAM font) {
+    SendMessageW(hwnd, WM_SETFONT, (WPARAM)font, TRUE);
+    return TRUE;
 }
+
+static const wchar_t *help_text_left(void) {
+    return
+        L"[파일]\r\n"
+        L"  Ctrl+O               열기\r\n"
+        L"  Ctrl+S               다른 이름으로 저장\r\n"
+        L"\r\n"
+        L"[편집]\r\n"
+        L"  Ctrl+C               선택 복사\r\n"
+        L"  Ctrl+A               모두 선택\r\n"
+        L"  마우스 드래그        텍스트 선택\r\n"
+        L"  Shift+← / →          한 글자 선택\r\n"
+        L"  Shift+↑ / ↓          한 줄 선택\r\n"
+        L"  Shift+Home / End     줄 시작/끝 선택\r\n"
+        L"  Shift+Ctrl+Home/End  문서 처음/끝 선택\r\n"
+        L"\r\n"
+        L"[찾기 / 이동]\r\n"
+        L"  Ctrl+F               찾기 (Esc 취소)\r\n"
+        L"  F3 / Shift+F3        다음 / 이전\r\n"
+        L"  Ctrl+G               줄 이동\r\n"
+        L"  Ctrl+T               목차 (마크다운 #)\r\n"
+        L"\r\n"
+        L"[책갈피]\r\n"
+        L"  Ctrl+B               책갈피 토글\r\n"
+        L"  Ctrl+, / Ctrl+.      이전 / 다음";
+}
+
+static const wchar_t *help_text_right(void) {
+    return
+        L"[보기]\r\n"
+        L"  Ctrl+L               줄 번호 토글\r\n"
+        L"  Ctrl+D               다크 모드\r\n"
+        L"  Ctrl+W               자동 줄바꿈\r\n"
+        L"  Alt+1                두 쪽 보기\r\n"
+        L"  F11                  전체화면 (Esc 해제)\r\n"
+        L"\r\n"
+        L"[인코딩]\r\n"
+        L"  F2 / Shift+F2        CP949 ↔ UTF-8 ↔ Johab\r\n"
+        L"  (UTF-16, Shift-JIS는 메뉴에서 선택)\r\n"
+        L"\r\n"
+        L"[폰트]\r\n"
+        L"  Ctrl+Shift+, / .     크기 - / +\r\n"
+        L"  Ctrl+휠              크기 - / +\r\n"
+        L"  Shift+휠             줄 간격\r\n"
+        L"  Ctrl+Shift+휠        자간\r\n"
+        L"\r\n"
+        L"[스크롤]\r\n"
+        L"  ↑ / ↓                한 줄\r\n"
+        L"  PageUp / PageDown    한 화면\r\n"
+        L"  Home / End           처음 / 끝\r\n"
+        L"  Ctrl+Home / End      처음 / 끝\r\n"
+        L"  ← / →                가로\r\n"
+        L"  Alt+화살표           여백 조절\r\n"
+        L"  Space                자동 스크롤\r\n"
+        L"\r\n"
+        L"[도움말]\r\n"
+        L"  F1                   이 도움말";
+}
+
+static LRESULT CALLBACK help_wnd_proc(HWND hwnd, UINT msg,
+                                      WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hi = ((CREATESTRUCTW*)lp)->hInstance;
+
+        /* 모노스페이스 — 단축키 컬럼 정렬용. Consolas는 Windows 기본 포함,
+         * lfCharSet=DEFAULT_CHARSET 으로 한글 글리프는 시스템 fallback. */
+        LOGFONTW lf = { 0 };
+        lf.lfHeight  = -MulDiv(10, g_help->dpi, 72);
+        lf.lfWeight  = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Consolas");
+        g_help->font = CreateFontIndirectW(&lf);
+
+        CreateWindowW(L"STATIC", help_text_left(),
+                      WS_CHILD | WS_VISIBLE | SS_LEFT,
+                      HELP_SCALE(16), HELP_SCALE(12),
+                      HELP_SCALE(360), HELP_SCALE(450),
+                      hwnd, NULL, hi, NULL);
+        CreateWindowW(L"STATIC", help_text_right(),
+                      WS_CHILD | WS_VISIBLE | SS_LEFT,
+                      HELP_SCALE(396), HELP_SCALE(12),
+                      HELP_SCALE(360), HELP_SCALE(450),
+                      hwnd, NULL, hi, NULL);
+        CreateWindowW(L"BUTTON", L"닫기",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      HELP_SCALE(660), HELP_SCALE(474),
+                      HELP_SCALE(96), HELP_SCALE(28),
+                      hwnd, (HMENU)(UINT_PTR)IDOK, hi, NULL);
+
+        EnumChildWindows(hwnd, help_set_font,
+                         (LPARAM)(g_help->font ? g_help->font
+                                              : (HFONT)GetStockObject(DEFAULT_GUI_FONT)));
+        return 0;
+    }
+    case WM_DESTROY:
+        if (g_help && g_help->font) {
+            DeleteObject(g_help->font);
+            g_help->font = NULL;
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            g_help->done = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        g_help->done = 1;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void cmd_show_help(void) {
+    static int registered = 0;
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc   = help_wnd_proc;
+        wc.hInstance     = hi;
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"hview_help";
+        RegisterClassExW(&wc);
+        registered = 1;
+    }
+
+    HWND parent = g_state.hwnd;
+    int dpi;
+    {
+        HDC hdc = GetDC(parent);
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(parent, hdc);
+        if (dpi <= 0) dpi = 96;
+    }
+
+    HelpCtx ctx;
+    ctx.dpi  = dpi;
+    ctx.done = 0;
+    ctx.font = NULL;
+    g_help = &ctx;
+
+    /* 96 DPI 기준 780×560 — 두 컬럼 + 닫기 버튼 + 하단 여백.
+     * 외곽 크기에서 타이틀바(~31px)와 아래 테두리를 빼고도 버튼이
+     * 가장자리와 겹치지 않도록 약 22px 여백 확보. */
+    int w = MulDiv(780, dpi, 96);
+    int h = MulDiv(560, dpi, 96);
+    RECT pr;
+    GetWindowRect(parent, &pr);
+    int x = pr.left + ((pr.right - pr.left) - w) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - h) / 2;
+
+    HWND dlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        L"hview_help", L"hViewer 단축키 & 도움말",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, w, h, parent, NULL, hi, NULL);
+    if (!dlg) { g_help = NULL; return; }
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    MSG msg;
+    while (ctx.done == 0 && GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    g_help = NULL;
+}
+
+#undef HELP_SCALE
 
 static void cmd_toggle_fullscreen(void) {
     HWND hwnd = g_state.hwnd;
@@ -2856,6 +3007,15 @@ static void recent_rebuild_menu(void) {
                      L"&%d  %s", (i + 1) % 10, fname);
         AppendMenuW(m, MF_STRING, IDM_RECENT_BASE + i, label);
     }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_RECENT_CLEAR, L"목록 지우기(&C)");
+}
+
+static void cmd_clear_recent(void) {
+    g_state.recent_count = 0;
+    recent_save();              /* 빈 상태 — 모든 슬롯이 RegDeleteValueW로 정리됨 */
+    recent_rebuild_menu();
+    if (!g_state.fs_active) DrawMenuBar(g_state.hwnd);
 }
 
 static void recent_add(const wchar_t *path) {
@@ -3457,11 +3617,14 @@ static HMENU create_menu(void) {
     HMENU enc_menu = CreatePopupMenu();
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_AUTO,    L"자동 판별");
     AppendMenuW(enc_menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF8,    L"UTF-8\tF2 (순환)");
+    /* F2 순환 그룹 — 한국어 텍스트의 거의 모든 케이스. 라벨에 \tF2 표시. */
+    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_CP949,   L"CP949 (EUC-KR)\tF2");
+    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF8,    L"UTF-8\tF2");
+    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_JOHAB,   L"조합형 (Johab)\tF2");
+    AppendMenuW(enc_menu, MF_SEPARATOR, 0, NULL);
+    /* 메뉴 전용 — 빈도가 낮아 F2 순환에서 제외 */
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF16LE, L"UTF-16 LE");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_UTF16BE, L"UTF-16 BE");
-    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_CP949,   L"CP949 (EUC-KR)");
-    AppendMenuW(enc_menu, MF_STRING, IDM_ENC_JOHAB,   L"조합형 (Johab)");
     AppendMenuW(enc_menu, MF_STRING, IDM_ENC_SJIS,    L"Shift-JIS (일본어)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)enc_menu, L"인코딩(&E)");
 
@@ -3884,6 +4047,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"최대 64MB, 조합형/완성형 지원\n\n"
                 L"https://github.com/chobocho/hviewer",
                 APP_TITLE, MB_OK | MB_ICONINFORMATION);
+            break;
+        case IDM_RECENT_CLEAR:
+            cmd_clear_recent();
             break;
         default: {
             int id = LOWORD(wp);
