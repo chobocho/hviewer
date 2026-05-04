@@ -67,7 +67,7 @@
  * ------------------------------------------------------------------ */
 #define MAX_FILE_SIZE       (64 * 1024 * 1024)   /* 64MB */
 #define INITIAL_LINE_CAP    1024
-#define APP_TITLE           L"hViewer V0.1a"
+#define APP_TITLE           L"hViewer V0.1b"
 
 /* 자동 스크롤 타이머 */
 #define AUTOSCROLL_TIMER_ID 1
@@ -908,20 +908,6 @@ static int pane_at_x(int mx) {
  * (분할 시 두 페인이 동일 폭이라 양쪽 모두 같은 wrap 적용 가능) */
 static int text_area_width(void) {
     return pane_text_area_width(g_state.active_pane);
-}
-
-/* 줄 사이 간격 포함 한 줄 총 높이 */
-static const wchar_t *encoding_name(Encoding e) {
-    switch (e) {
-    case ENC_UTF8:     return L"UTF-8";
-    case ENC_UTF8_BOM: return L"UTF-8 BOM";
-    case ENC_UTF16_LE: return L"UTF-16 LE";
-    case ENC_UTF16_BE: return L"UTF-16 BE";
-    case ENC_CP949:    return L"CP949";
-    case ENC_JOHAB:    return L"Johab";
-    case ENC_SJIS:     return L"Shift-JIS";
-    default:           return L"?";
-    }
 }
 
 /* ------------------------------------------------------------------
@@ -1985,6 +1971,10 @@ static void search_jump_to(int offset) {
     }
     InvalidateRect(g_state.hwnd, NULL, FALSE);
 }
+
+/* search_history_*는 cmd_find 등에서 호출되지만 정의는 한참 아래. */
+static void search_history_add(const wchar_t *needle);
+static void search_history_rebuild_menu(void);
 
 static void cmd_find(void) {
     if (g_state.text_len == 0) return;

@@ -30,10 +30,10 @@ build.bat
 
 | 모듈 | 테스트 수 | 비고 |
 |------|---------:|------|
-| `johab.h` | 18 | 디코더, 점수, UTF-16 변환 (Phase 0) |
-| `sjis.h`  |  5 | 점수 휴리스틱 (Phase 5) |
-| `hanja.h` | 15 | 한자/가나 → 한글 음, CJK/가나 범위 판별 (Phase 6) |
-| `encoding.h` | 17 | BOM, UTF-8 유효성, CP949 점수, 변환 디스패치 (Win32 전용) |
+| `johab.h` | 21 | 디코더, 점수, UTF-16 변환, Hangul 절대 카운트 (Phase 0) |
+| `sjis.h`  |  7 | 점수 휴리스틱, lead/trail/kana predicate 경계 (Phase 5) |
+| `hanja.h` | 17 | 한자/가나 → 한글 음, CJK/가나 범위, KANA 테이블 경계 (Phase 6) |
+| `encoding.h` | 33 | BOM, UTF-8 유효성(2/3/4B+overlong), CP949/Johab 점수, 보조영역 비율, 변환 디스패치, 라운드트립 (Win32 전용) |
 
 ## 향후 phase별 추가
 

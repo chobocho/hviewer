@@ -201,6 +201,32 @@ TEST(johab_to_utf16_empty) {
     ASSERT_EQ(dst[0], 0xDEAD);
 }
 
+TEST(johab_hangul_count_empty) {
+    ASSERT_EQ(johab_hangul_count(NULL, 0), 0u);
+    const unsigned char ascii[] = "Hello";
+    ASSERT_EQ(johab_hangul_count(ascii, sizeof(ascii) - 1), 0u);
+}
+
+TEST(johab_hangul_count_all_valid) {
+    /* '가한글힣' 4 음절 — 절대 카운트 4 */
+    const unsigned char buf[] = {
+        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x69, 0xD3, 0xBD,
+    };
+    ASSERT_EQ(johab_hangul_count(buf, sizeof(buf)), 4u);
+}
+
+TEST(johab_hangul_count_skips_ascii_and_invalid) {
+    /* ASCII 섞인 입력에서 한글만 셈. invalid pair는 카운트 안 됨. */
+    const unsigned char buf[] = {
+        0x88, 0x61,        /* 가 (valid) */
+        0x41,              /* 'A' — ASCII, skipped */
+        0xD0, 0x65,        /* 한 (valid) */
+        0x80, 0x00,        /* invalid (cho_bits=0) */
+        0x8B, 0x69,        /* 글 (valid) */
+    };
+    ASSERT_EQ(johab_hangul_count(buf, sizeof(buf)), 3u);
+}
+
 /* ==================================================================
  * Phase 5 — sjis.h (휴리스틱 스코어, 순수 C — 어디서나 빌드)
  * ================================================================== */
@@ -235,6 +261,40 @@ TEST(sjis_score_invalid_lead_zero) {
     /* 0x80, 0xA0, 0xFD-0xFF — SJIS lead/kana 어디에도 안 맞음 */
     const unsigned char buf[] = { 0x80, 0xA0, 0xFE, 0xFF };
     ASSERT_EQ(sjis_score(buf, sizeof(buf)), 0);
+}
+
+TEST(sjis_predicates_boundaries) {
+    /* lead: 0x81-0x9F, 0xE0-0xFC */
+    ASSERT_FALSE(sjis_is_lead(0x80));
+    ASSERT_TRUE (sjis_is_lead(0x81));
+    ASSERT_TRUE (sjis_is_lead(0x9F));
+    ASSERT_FALSE(sjis_is_lead(0xA0));
+    ASSERT_FALSE(sjis_is_lead(0xDF));   /* 가나 영역 */
+    ASSERT_TRUE (sjis_is_lead(0xE0));
+    ASSERT_TRUE (sjis_is_lead(0xFC));
+    ASSERT_FALSE(sjis_is_lead(0xFD));
+
+    /* trail: 0x40-0x7E, 0x80-0xFC */
+    ASSERT_FALSE(sjis_is_trail(0x3F));
+    ASSERT_TRUE (sjis_is_trail(0x40));
+    ASSERT_TRUE (sjis_is_trail(0x7E));
+    ASSERT_FALSE(sjis_is_trail(0x7F));
+    ASSERT_TRUE (sjis_is_trail(0x80));
+    ASSERT_TRUE (sjis_is_trail(0xFC));
+    ASSERT_FALSE(sjis_is_trail(0xFD));
+
+    /* 반각 가나: 0xA1-0xDF */
+    ASSERT_FALSE(sjis_is_kana(0xA0));
+    ASSERT_TRUE (sjis_is_kana(0xA1));
+    ASSERT_TRUE (sjis_is_kana(0xDF));
+    ASSERT_FALSE(sjis_is_kana(0xE0));
+}
+
+TEST(sjis_score_lead_without_trail) {
+    /* 첫 페어는 valid kanji, 둘째 lead 0x82는 trail 0x00 — invalid trail.
+     *   attempts=2, hits=1 → 50점. 잘린 lead가 hit로 잡히지 않음을 확인. */
+    const unsigned char buf[] = { 0x82, 0xA0, 0x82, 0x00 };
+    ASSERT_EQ(sjis_score(buf, sizeof(buf)), 50);
 }
 
 /* ==================================================================
@@ -337,6 +397,25 @@ TEST(is_kana_hiragana_and_katakana) {
     ASSERT_FALSE(is_kana(0x3040));  /* 가나 직전 */
     ASSERT_FALSE(is_kana(0x3100));  /* 가나 직후 */
     ASSERT_FALSE(is_kana(0x4E00));  /* 한자 */
+}
+
+TEST(kana_table_first_and_last) {
+    /* KANA_TABLE 첫 엔트리 ぁ(0x3041) 와 마지막 엔트리 ん(0x3093) — 이진
+     * 탐색 경계가 양 끝을 빠뜨리지 않는지 확인. */
+    const wchar_t *first = kana_to_hangul(0x3041);
+    ASSERT_TRUE(first != NULL);
+    ASSERT_EQ(first[0], 0xC544);    /* 아 */
+
+    const wchar_t *last = kana_to_hangul(0x3093);
+    ASSERT_TRUE(last != NULL);
+    ASSERT_EQ(last[0], 0xC751);     /* 응 */
+}
+
+TEST(kana_table_gap_returns_null) {
+    /* KANA_TABLE에 비어 있는 코드포인트 (ゐ U+3090, ゑ U+3091 — 폐자
+     * 히라가나로 현대 일본어 미사용) — 이진 탐색이 NULL 반환해야 함. */
+    ASSERT_TRUE(kana_to_hangul(0x3090) == NULL);
+    ASSERT_TRUE(kana_to_hangul(0x3091) == NULL);
 }
 
 /* ==================================================================
@@ -627,6 +706,67 @@ TEST(roundtrip_johab_to_utf16_one_way) {
     free(w);
 }
 
+TEST(encoding_name_lookup_known) {
+    /* 상태바/메뉴 표시에 쓰는 라벨 — 모든 enum이 비-NULL을 반환해야 한다. */
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_UTF8_BOM), L"UTF-8 (BOM)") == 0);
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_UTF16_LE), L"UTF-16 LE")   == 0);
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_UTF16_BE), L"UTF-16 BE")   == 0);
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_UTF8),     L"UTF-8")       == 0);
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_SJIS),     L"Shift-JIS")   == 0);
+    ASSERT_TRUE(wcscmp(encoding_name(ENC_UNKNOWN),  L"Unknown")     == 0);
+    /* CP949/Johab는 한글 라벨 — wchar_t 비교만 확인 */
+    ASSERT_TRUE(encoding_name(ENC_CP949) != NULL);
+    ASSERT_TRUE(encoding_name(ENC_JOHAB) != NULL);
+}
+
+TEST(cp949_extension_ratio_pure_cp949_low) {
+    /* "가한" CP949: 0xB0 0xA1 0xC7 0xD1 — 두 페어 모두 표준 영역.
+     *   lead 0xB0,0xC7 ∉ 0x81-0xA0,  trail 0xA1,0xD1 ∉ 0x41-0x7A → ext=0% */
+    const unsigned char buf[] = { 0xB0, 0xA1, 0xC7, 0xD1 };
+    ASSERT_EQ(cp949_extension_ratio(buf, sizeof(buf)), 0);
+}
+
+TEST(cp949_extension_ratio_johab_high) {
+    /* Johab "가한글힣" — 비트 패킹이 보조 영역에 자주 떨어진다.
+     *   0x88,0x61: lead 0x88 ∈ 0x81-0xA0 → ext
+     *   0xD0,0x65: trail 0x65 ∈ 0x41-0x7A → ext
+     *   0x8B,0x69: lead 0x8B ∈ 0x81-0xA0 → ext
+     *   0xD3,0xBD: 둘 다 보조영역 밖 → not ext
+     *   ratio = 3/4 = 75% — Johab 식별 휴리스틱(>=30%)을 만족 */
+    const unsigned char buf[] = {
+        0x88, 0x61, 0xD0, 0x65, 0x8B, 0x69, 0xD3, 0xBD,
+    };
+    ASSERT_EQ(cp949_extension_ratio(buf, sizeof(buf)), 75);
+}
+
+TEST(utf8_validity_2byte_sequence) {
+    /* "©" U+00A9 = 0xC2 0xA9 — 2바이트 시퀀스 단독 */
+    const unsigned char buf[] = { 0xC2, 0xA9 };
+    ASSERT_GE(utf8_validity_score(buf, sizeof(buf)), 1);
+}
+
+TEST(utf8_validity_4byte_emoji) {
+    /* "🎉" U+1F389 = 0xF0 0x9F 0x8E 0x89 — 4바이트 시퀀스 */
+    const unsigned char buf[] = { 0xF0, 0x9F, 0x8E, 0x89 };
+    ASSERT_GE(utf8_validity_score(buf, sizeof(buf)), 1);
+}
+
+TEST(utf8_validity_rejects_f5_lead) {
+    /* 0xF5 이상의 lead byte는 U+10FFFF 초과 → 거부 */
+    const unsigned char buf[] = { 0xF5, 0x80, 0x80, 0x80 };
+    ASSERT_EQ(utf8_validity_score(buf, sizeof(buf)), 0);
+}
+
+TEST(convert_unknown_returns_null) {
+    /* default 분기 — ENC_UNKNOWN으로 호출하면 NULL.
+     *   src_len > 0 이어야 default switch 경로로 진입. */
+    const unsigned char buf[] = { 'a' };
+    size_t wlen = 0xDEAD;
+    wchar_t *out = convert_to_utf16(buf, sizeof(buf), ENC_UNKNOWN, &wlen);
+    ASSERT_TRUE(out == NULL);
+    ASSERT_EQ(wlen, 0u);
+}
+
 #endif /* _WIN32 */
 
 /* ==================================================================
@@ -682,6 +822,9 @@ int main(void) {
     RUN(johab_to_utf16_invalid_pair_yields_replacement);
     RUN(johab_to_utf16_mixed);
     RUN(johab_to_utf16_empty);
+    RUN(johab_hangul_count_empty);
+    RUN(johab_hangul_count_all_valid);
+    RUN(johab_hangul_count_skips_ascii_and_invalid);
 
     printf("\n[sjis.h]\n");
     RUN(sjis_score_pure_ascii_zero);
@@ -689,6 +832,8 @@ int main(void) {
     RUN(sjis_score_half_width_kana_all_hits);
     RUN(sjis_score_two_byte_kanji_all_hits);
     RUN(sjis_score_invalid_lead_zero);
+    RUN(sjis_predicates_boundaries);
+    RUN(sjis_score_lead_without_trail);
 
     printf("\n[hanja.h]\n");
     RUN(hanja_known_mapping_il);
@@ -706,6 +851,8 @@ int main(void) {
     RUN(is_cjk_extension_a_and_compat);
     RUN(is_cjk_rejects_hangul_and_ascii);
     RUN(is_kana_hiragana_and_katakana);
+    RUN(kana_table_first_and_last);
+    RUN(kana_table_gap_returns_null);
 
 #ifdef _WIN32
     printf("\n[encoding.h]\n");
@@ -735,6 +882,13 @@ int main(void) {
     RUN(roundtrip_utf8_bom_strips_then_restores);
     RUN(roundtrip_empty_string);
     RUN(roundtrip_johab_to_utf16_one_way);
+    RUN(encoding_name_lookup_known);
+    RUN(cp949_extension_ratio_pure_cp949_low);
+    RUN(cp949_extension_ratio_johab_high);
+    RUN(utf8_validity_2byte_sequence);
+    RUN(utf8_validity_4byte_emoji);
+    RUN(utf8_validity_rejects_f5_lead);
+    RUN(convert_unknown_returns_null);
 #else
     printf("\n[encoding.h] skipped — requires Win32 (build on MinGW or MSVC)\n");
 #endif
