@@ -1,5 +1,25 @@
 # hview 변경 이력
 
+## v0.1.b (2026-05-05) — UX 정리
+
+### UI / UX
+- **F1 단축키 도움말 — 두 컬럼 모달 다이얼로그.** 가변폭 MessageBox 단일 컬럼 → Consolas 모노스페이스 + 좌/우 STATIC 두 컬럼. 단축키 컬럼이 정렬되고 카테고리가 한 화면에 들어옴. DPI 자동 스케일, Esc/X/닫기 모두 종료. `prompt_input` 패턴 재사용으로 .rc 자원 의존성 0 유지.
+- **F2 인코딩 순환 단순화 — CP949 ↔ UTF-8 ↔ Johab 3종.** 기존 6종 순환에서 한국어 텍스트의 거의 모든 케이스만 남김. UTF-16 LE/BE, Shift-JIS는 메뉴(인코딩)에서만 선택. 메뉴는 자동 판별 / 순환 그룹(`\tF2` 표시) / 비-순환 그룹 3블록을 구분선으로 분리. cycle 밖 인코딩(UTF-16/SJIS)에서 F2를 누르면 CP949로 진입.
+- **파일 → 최근 파일 → "목록 지우기"** 메뉴 추가 (`IDM_RECENT_CLEAR`). `recent_count=0` + `recent_save`로 레지스트리 슬롯 0..9까지 모두 정리.
+- 앱 타이틀: V0.1.0 → V0.1b
+
+### 아이콘
+- 새 디스켓 디자인 `icon.png` 적용 + 16/24/32/48/64/128/256 멀티사이즈 `icon.ico` 재생성. Explorer/Alt-Tab/창 아이콘 모두 자동 갱신.
+
+### 코드 정리
+- `encoding_name` 중복 정의 제거 — `hview.c`와 `encoding.h` 양쪽에 있던 같은 `static` 함수가 MSVC C2084로 빌드를 깨뜨리던 문제. `encoding.h`의 정의로 통일하면서 라벨도 자세한 형식("UTF-8 (BOM)", "CP949 (EUC-KR)", "Johab (조합형)", "Unknown")으로 일원화.
+- `search_history_add` / `search_history_rebuild_menu` forward 선언 추가 — 정의보다 앞 줄에서 호출되어 implicit-int 가정으로 C2371 재정의 충돌이 발생하던 문제 해소.
+
+### 테스트
+- 단위 테스트 78 → 81 (리뷰 후 -3 +5+1). 미커버 분기를 보강하고 다른 테스트가 동일 경로를 더 강하게 검증하던 중복은 정리.
+  - 추가: `johab_hangul_count_*`(3), `johab_to_utf16_output_count_bounded_by_src_len`, `sjis_predicates_boundaries`, `sjis_score_lead_without_trail`, `kana_table_first_and_last`, `kana_table_gap_returns_null`, `encoding_name_lookup_known`, `cp949_extension_ratio_*`(2), `utf8_validity_2byte/4byte/F5/잘림 처리 2`, `convert_unknown_*`(2), `detect_empty_buffer_falls_back_to_cp949`, `detect_sjis_japanese_text`(`日本語日本語` — 첫 SJIS detect 분기 커버).
+  - 제거(중복): `roundtrip_utf8_ascii`, `roundtrip_empty_string`, `convert_johab_dispatches_correctly`.
+
 ## v0.1.0 (2026-05-03) — 초기 골격
 
 ### 기능
